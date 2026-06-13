@@ -3,6 +3,11 @@
 [![Releases](https://img.shields.io/github/release/f5networks/f5-aws-cloudformation-v2.svg)](https://github.com/f5networks/f5-aws-cloudformation-v2/releases)
 [![Issues](https://img.shields.io/github/issues/f5networks/f5-aws-cloudformation-v2.svg)](https://github.com/f5networks/f5-aws-cloudformation-v2/issues)
 
+> ## 🇺🇸 GovCloud edition
+> This is the **AWS GovCloud (US)** adaptation of F5's CloudFormation templates, maintained in [F5GovSolutions](https://github.com/F5GovSolutions) (the upstream [`F5Networks/f5-aws-cloudformation-v2`](https://github.com/F5Networks/f5-aws-cloudformation-v2) is in sustainment). It adds GovCloud/air-gap support to the **failover** solution: staged-bucket deployment, automated VPC endpoints (S3, EC2, Secrets Manager, CloudFormation), and an automated clustering self-heal that works around a documented BIG-IP device-trust startup bug.
+>
+> **➡️ Start here:** [**`examples/failover/GOVCLOUD-GUIDE.md`**](./examples/failover/GOVCLOUD-GUIDE.md) — a complete, first-time-operator walkthrough for deploying into GovCloud, including fully air-gapped environments.
+
 ## F5 BIG-IP AWS CloudFormation 2.0
 
 

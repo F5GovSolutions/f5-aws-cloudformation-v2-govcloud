@@ -308,7 +308,7 @@ This **4-EIP air-gap profile** (public mgmt, private VIP, private Self IPs) fits
 
 ## 10. Launch the stack
 
-> ### Rollback: optional (it was required during bring-up; the stack now self-completes)
+> ### Rollback: optional (it may be required for troubleshooting; the stack now self-heals and completes)
 > The stack **completes on its own** — the self-heal ([§12](#12-automatic-clustering-recovery-the-self-heal)) forms the cluster and sends the CloudFormation success signal — so **normal rollback-on-failure is fine for production** (a genuine failure cleans up as usual). For a **first deploy in a new environment**, you may still prefer rollback **disabled** (CLI `--disable-rollback`, or Console **Stack failure options → Preserve successfully provisioned resources**) as a safety net: if something environment-specific goes wrong during the ~25-30 min the self-heal runs, the instances survive so you can read `/config/cluster-heal/log` instead of losing them. *(If you disable rollback and a deploy fails, delete the stack and release orphaned EIPs before retrying.)*
 
 ### Option A — AWS Console (GUI)
@@ -388,7 +388,7 @@ There is a **documented BIG-IP / Declarative Onboarding platform bug** in the 17
 - `01020036:3: The requested trust domain (/Common/Root) was not found.`
 - `01020036:3: The requested device group (/Common/failoverGroup) was not found.`
 
-F5's documented workaround is: **reboot** (which rebuilds `Root`), then **re-apply** clustering. F5's KB scopes this to 17.5.x, but this solution **reproduced the identical failure on 17.1.3.2** as well — so treat it as affecting the **17.x line generally (and possibly other versions)**. It's a platform-timing issue, **not** caused by GovCloud, the security groups, the endpoints, or this template — and you **cannot** dodge it by picking a different 17.x image (we tried).
+F5's documented workaround is: **reboot** (which rebuilds `Root`), then **re-apply** clustering. F5's KB scopes this to 17.5.x, but this solution **reproduced the identical failure on 17.1.3.2** as well — so treat it as affecting the **17.x line generally (and possibly other versions)**. It's a platform-timing issue, **not** caused by GovCloud, the security groups, the endpoints, or this template — and you **cannot** escape it by picking a different 17.x image (I tried).
 
 Because the point of a template is to remove manual steps, this solution ships a **self-heal** that automates F5's documented workaround. Importantly, **the DO declaration is left stock** — DO remains the declarative source of truth for clustering; the self-heal only *bootstraps* what the platform bug prevented DO from completing, and the resulting cluster matches the DO declaration (no config drift, nothing for a future DO re-apply/upgrade to tear down). On a BIG-IP build where the bug doesn't occur, the self-heal simply sees the cluster already In Sync and disables itself — it is a **safety net, not a dependency**.
 
@@ -413,7 +413,7 @@ Repo sources: `examples/failover/bigip-configurations/cluster-heal.sh` and `clus
 The CloudFormation signal in steps 1/6 is why **`provisionS3Endpoint=true` also provisions a CloudFormation VPC endpoint** (see [§9](#9-air-gap-choose-your-public-ip-toggles-and-endpoints)): with no dataplane egress the BIG-IP can't reach `cloudformation.<region>.amazonaws.com`, and the stack would time out even though the cluster formed.
 
 ### What to expect on a deploy
-- The stack stays **`CREATE_IN_PROGRESS` for ~25-30 minutes** while the self-heal reboots and forms the cluster — this is normal — then flips to **`CREATE_COMPLETE`**. (The CreationPolicy timeout is `PT50M`.)
+- The stack stays **`CREATE_IN_PROGRESS` for ~25-30 minutes** while the self-heal reboots and forms the cluster — this is normal — then flips to **`CREATE_COMPLETE`**. (The CreationPolicy timeout is `PT50M` or 50 minutes, after which the template will fail and either rollback and keep deployed objects or delete the entire stack based on the options you selected when you launched the template.)
 - No manual steps; the cluster comes up on its own and the stack signals success only once it is genuinely In Sync (a real failure still surfaces honestly as CREATE_FAILED via the timeout).
 
 ### Where the logs are / how to watch it
