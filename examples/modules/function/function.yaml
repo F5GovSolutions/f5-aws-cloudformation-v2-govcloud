@@ -160,10 +160,9 @@ Resources:
         ZipFile: !Sub |
           import json
           import boto3
-          import requests
-          #from botocore.vendored import requests
-          #from botocore.config import Config
+          import urllib3
 
+          http = urllib3.PoolManager()
           ec2_client = boto3.client('ec2')
           def lambda_handler(event, context):
               # immediate response to CF Stack DELETE Action
@@ -213,14 +212,16 @@ Resources:
                               'RequestId': event['RequestId'],
                               'LogicalResourceId': event['LogicalResourceId'],
                               'Data': responseData}
-              print ('RESPONSE BODY:\n' + json.dumps(responseBody))
+              jsonResponseBody = json.dumps(responseBody)
+              print ('RESPONSE BODY:\n' + jsonResponseBody)
+              headers = {'content-type': '', 'content-length': str(len(jsonResponseBody))}
               try:
-                  req = requests.put(event['ResponseURL'], data=json.dumps(responseBody))
-                  if req.status_code != 200:
-                      print(req.text)
+                  req = http.request('PUT', event['ResponseURL'], headers=headers, body=jsonResponseBody)
+                  if req.status != 200:
+                      print(req.data)
                       raise Exception('Received non 200 response while sending response to CF Stack.')
                   return
-              except requests.exceptions.RequestException as e:
+              except urllib3.exceptions.HTTPError as e:
                   print(e)
                   raise
           if __name__ == '__main__':
@@ -236,12 +237,6 @@ Resources:
       Role: !Ref amiLookupRole
       Runtime: python3.12
       Timeout: 30
-      Layers:
-        - !Join
-          - ''
-          - - 'arn:aws:lambda:'
-            - !Ref AWS::Region
-            - ':089591600128:layer:f5-lambda-requests-layer:2'
       Tags:
         - Key: application
           Value: !Ref application

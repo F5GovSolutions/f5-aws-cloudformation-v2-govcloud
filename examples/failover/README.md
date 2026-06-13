@@ -18,6 +18,7 @@
   - [Deploying this Solution](#deploying-this-solution)
     - [Deploying via the AWS Deploy button](#deploying-via-the-aws-launch-stack-button)
     - [Deploying via the AWS CLI](#deploying-via-the-aws-cli)
+    - [Deploying in AWS GovCloud (US)](#deploying-in-aws-govcloud-us)
     - [Changing the BIG-IP Deployment](#changing-the-big-ip-deployment)
   - [Validation](#validation)
     - [Validating the Deployment](#validating-the-deployment)
@@ -63,11 +64,15 @@ The modules below create the following cloud resources:
 - **Access**: This template creates IAM Roles, AWS InstanceProfiles and ssh keys.
 - **BIG-IP**: This template creates F5 BIG-IP Virtual Edition instances provisioned with Local Traffic Manager (LTM) and (optionally) Application Security Manager (ASM). 
 
-By default, this solution (failover.yaml) creates a VPN with 4 subnets, an example Web Application instance, two PAYG BIG-IP instances with three network interfaces (one for management and two for dataplane/application traffic - called external and internal). Depending on settings, the number of Public IPs provisioned will vary.
-* Two EIPs will automatically be provisioned for the external Self IPs (for egress system routing).
-* Two EIPs will automatically be provisioned for NAT gateways.
-* If **provisionPublicIpMgmt** is set to **true**, two EIPs will be provisioned the Management Interfaces. If set to **false**, one EIP will be created for a bastion host. 
-* If **provisionExampleApp** is set to **true**, an additional EIP is provisioned for the virtual service.
+By default, this solution (failover.yaml) creates a VPC with 4 subnets, an example Web Application instance, two PAYG BIG-IP instances with three network interfaces (one for management and two for dataplane/application traffic - called external and internal). Depending on settings, the number of Public IPs (Elastic IPs, or "EIPs") provisioned will vary:
+* Two EIPs are always provisioned for the external Self IPs (for egress system routing).
+* Two EIPs are always provisioned for the NAT gateways (one per Availability Zone).
+* If **provisionPublicIpMgmt** is set to **true**, two EIPs are provisioned for the Management Interfaces. If set to **false**, one EIP is created for a bastion host.
+* If **provisionExternalVip** and **provisionPublicIpVip** are both **true**, one additional EIP is provisioned for the floating virtual service VIP. If **provisionPublicIpVip** is **false**, the VIP is private and no EIP is provisioned for it.
+
+For example, the default configuration (public management + public VIP) provisions **7 EIPs**; a private-VIP configuration with public management provisions **6 EIPs**.
+
+***DISCLAIMER/WARNING - Elastic IP (Public IP) quota***: This solution provisions multiple Elastic IPs (see the breakdown above). The **default AWS quota is only 5 Elastic IPs per Region** (and is frequently lower or further restricted in AWS GovCloud (US) and other locked-down/air-gapped accounts). If your account does not have enough Elastic IP capacity, the deployment **will fail** with `AddressLimitExceeded` ("The maximum number of addresses has been reached") — most commonly surfaced as a failure to create `BigipManagementEipAddress01` in the nested **Dag** stack. **Before deploying, confirm your Elastic IP quota and, if necessary, contact AWS to request an increase** (AWS Service Quotas → *EC2-VPC Elastic IPs*, quota code `L-0263D0A3`), or reduce the number of Public IPs using the parameters above. Note also that a stack launched with `--on-failure DO_NOTHING` does **not** release its Elastic IPs when it fails; delete such stacks (and release any orphaned addresses) before retrying, or they will continue to count against your quota.
 
 Application traffic from the Internet traverses an external network interface configured with both public and private IP addresses. Traffic to the application traverses an internal network interface configured with a private IP address.
 
@@ -86,6 +91,8 @@ For information about this type of deployment, see the F5 Cloud Failover Extensi
   - The appropriate permission in AWS to launch CloudFormation (CFT) templates. You must be using an IAM user with the AdministratorAccess policy attached and have permission to create the objects contained in this solution. VPCs, Routes, EIPs, EC2 Instances. For details on permissions and all AWS configuration, see AWS [documentation](https://aws.amazon.com/documentation/). 
 
   - Sufficient **EC2 Resources** to deploy this solution. For more information, see [AWS resource limit documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-resource-limits.html).
+
+  - Sufficient **Elastic IP (Public IP) quota**. This solution provisions **6-7 Elastic IPs** by default, while the default AWS quota is only **5 per Region** (and is often lower/restricted in AWS GovCloud (US)). Confirm your quota and, if needed, **contact AWS to request an increase** before deploying (AWS Service Quotas → *EC2-VPC Elastic IPs*, quota code `L-0263D0A3`). See [Important Configuration Notes](#important-configuration-notes) for the per-parameter EIP breakdown.
 
 ## Important Configuration Notes
 
@@ -343,9 +350,11 @@ As an alternative to deploying through the AWS Console (GUI), each solution prov
 
 By default, the templates in this repository are also publicly hosted on S3 at https[]()://f5-cft-v2.s3.amazonaws.com/f5-aws-cloudformation-v2/[VERSION]. If you want deploy the template using the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-welcome.html), provide url of the parent template and REQUIRED parameters:
 
+> **Rollback is optional.** The failover solution self-completes — a self-heal forms the cluster and sends the CloudFormation success signal (see *Clustering does not form / "no trust domain"* under [Troubleshooting Steps](#troubleshooting-steps)) — so normal rollback-on-failure is fine for production. For a **first deploy in a new environment** you may prefer to **disable automatic rollback** (`--disable-rollback`, or console **Stack failure options → Preserve successfully provisioned resources**) as a safety net, so the instances survive for inspection if something environment-specific fails during the ~25-30 min the self-heal runs. *(A failed stack left standing still holds its Elastic IPs — delete it and release any orphaned EIPs before retrying so they don't count against your quota.)*
+
 ```bash
  aws cloudformation create-stack --region ${REGION} --stack-name ${STACK_NAME} \
-  --template-url https://f5-cft-v2.s3.amazonaws.com/f5-aws-cloudformation-v2/v1.2.0.0/examples/failover/failover.yaml \
+  --template-url https://f5-cft-v2.s3.amazonaws.com/f5-aws-cloudformation-v2/v3.6.0.0/examples/failover/failover.yaml \
   --parameters "ParameterKey=<KEY>,ParameterValue=<VALUE> ParameterKey=<KEY>,ParameterValue=<VALUE>" \
   --capabilities CAPABILITY_NAMED_IAM
 ```
@@ -353,7 +362,7 @@ By default, the templates in this repository are also publicly hosted on S3 at h
 or with a local parameters file (see `failover-parameters.json` example in this directory):
 ```bash
  aws cloudformation create-stack --region ${REGION} --stack-name ${STACK_NAME} \
-  --template-url https://f5-cft-v2.s3.amazonaws.com/f5-aws-cloudformation-v2/v1.2.0.0/examples/failover/failover.yaml \
+  --template-url https://f5-cft-v2.s3.amazonaws.com/f5-aws-cloudformation-v2/v3.6.0.0/examples/failover/failover.yaml \
   --parameters file://failover-parameters.json \
   --capabilities CAPABILITY_NAMED_IAM
 ```
@@ -362,12 +371,151 @@ Example:
 
 ```bash
  aws cloudformation create-stack --region us-east-1 --stack-name myFailover \
-  --template-url https://f5-cft-v2.s3.amazonaws.com/f5-aws-cloudformation-v2/v1.2.0.0/examples/failover/failover.yaml \
+  --template-url https://f5-cft-v2.s3.amazonaws.com/f5-aws-cloudformation-v2/v3.6.0.0/examples/failover/failover.yaml \
   --parameters "ParameterKey=sshKey,ParameterValue=MY_SSH_KEY_NAME ParameterKey=restrictedSrcAddressMgmt,ParameterValue=55.55.55.55/32 ParameterKey=restrictedSrcAddressApp,ParameterValue=0.0.0.0/0,ParameterKey=bigIpSecretArn,ParameterValue=arn:aws:secretsmanager:us-west-1:012345678901:secret:myBigipSecret-Qnju" \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
 For next steps, see [Validating the Deployment](#validating-the-deployment).
+
+
+### Deploying in AWS GovCloud (US)
+
+AWS GovCloud (US) is a **separate AWS partition** (`aws-us-gov`) and cannot reach the commercial, F5-hosted template bucket (`f5-cft-v2` in `us-east-1`). If you launch with the default **s3BucketName**/**s3BucketRegion**, every nested stack fails because CloudFormation cannot fetch the module templates across partitions. To deploy in GovCloud you must **stage these templates (and ideally the BIG-IP runtime-init artifacts) in your own S3 bucket inside GovCloud** and repoint the template parameters.
+
+> **Note:** A "public" GovCloud S3 bucket is only reachable from within the GovCloud partition. Commercial AWS accounts and the public internet cannot reach GovCloud S3 endpoints. If your consumers deploy into GovCloud, public-read works for them; if they are in commercial AWS, they must stage their own copy in their own partition.
+
+#### 1. Stage the templates in a GovCloud bucket
+
+```bash
+REGION=us-gov-west-1                                   # or us-gov-east-1
+BUCKET=my-org-f5-cft-gov                               # must be unique within GovCloud
+PREFIX=f5-aws-cloudformation-v2/v3.6.0.0/examples
+
+aws s3api create-bucket \
+  --bucket "$BUCKET" --region "$REGION" \
+  --create-bucket-configuration LocationConstraint="$REGION"
+
+# From the root of this repository, preserving the modules/ layout:
+aws s3 sync ./examples/ "s3://$BUCKET/$PREFIX/" --region "$REGION"
+```
+
+#### 2. Make the runtime-init artifacts readable by the BIG-IP (REQUIRED)
+
+This step is **required**, not optional — the BIG-IP cannot onboard without it. Two different consumers read this bucket, and they authenticate differently:
+
+- **CloudFormation** fetches the nested **templates** (`modules/**`) using *your* IAM credentials, so a private bucket is fine for those.
+- **The BIG-IP itself** downloads the **runtime-init package (`.run`), the `runtime-init-conf-*.yaml` config files, and the DO/AS3/CF extension RPMs** at boot via **unauthenticated HTTPS (`curl`)** — with no AWS signature. If those objects are not anonymously readable, the BIG-IP gets **HTTP 403**, `f5-bigip-runtime-init` never installs, no DO/AS3/CFE configuration is applied, and the stack eventually **rolls back and deletes the instances** — often with no obvious error in the CloudFormation events.
+
+GovCloud enables S3 Block Public Access (BPA) by default and disables ACLs (Object Ownership = *Bucket owner enforced*), so grant access via a **bucket policy** — not ACLs. **Note:** clearing BPA alone grants nothing; you must also apply the policy below.
+
+First allow a public bucket policy (leave ACL blocking on; you only need a public policy):
+
+```bash
+aws s3api put-public-access-block \
+  --bucket "$BUCKET" \
+  --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false
+```
+> If your organization enforces account-level BPA, an administrator must also clear `BlockPublicPolicy`/`RestrictPublicBuckets` at the account level (`aws s3control put-public-access-block`).
+
+Then apply a read-only policy (`bucket-policy.json`, replace the bucket name):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublicReadGetObject",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws-us-gov:s3:::my-org-f5-cft-gov/*"
+    },
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws-us-gov:s3:::my-org-f5-cft-gov",
+        "arn:aws-us-gov:s3:::my-org-f5-cft-gov/*"
+      ],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    }
+  ]
+}
+```
+```bash
+aws s3api put-bucket-policy --bucket "$BUCKET" --policy file://bucket-policy.json
+```
+
+Security notes:
+- Grant **`s3:GetObject` only**. Never grant `s3:PutObject`/`s3:DeleteObject` to `Principal: "*"` — that would let anyone overwrite the templates consumed by every deployer.
+- `s3:ListBucket` is intentionally omitted so the bucket cannot be enumerated; CloudFormation and the BIG-IP only need `GetObject` on specific keys.
+- **Prefer scoping over public.** If consumer AWS account IDs are known, replace `"Principal": "*"` with `"Principal": { "AWS": ["arn:aws-us-gov:iam::ACCOUNT_ID:root", ...] }` (or gate on `aws:PrincipalOrgID`). Use `"*"` only if you cannot enumerate consumers.
+
+**Verify anonymous read of the actual BIG-IP artifacts** — this is exactly what the BIG-IP does at boot (plain `curl`, no credentials). All must return **HTTP 200**:
+```bash
+for KEY in \
+  "${PREFIX}/failover/failover.yaml" \
+  "${PREFIX}/f5-bigip-runtime-init-2.0.3-1.gz.run" \
+  "${PREFIX}/failover/bigip-configurations/runtime-init-conf-3nic-payg-instance01-with-app.yaml" \
+  "${PREFIX}/bigip-extensions/f5-declarative-onboarding-1.47.0-14.noarch.rpm"; do
+  printf '%s  %s\n' "$(curl -sk -o /dev/null -w '%{http_code}' "https://${BUCKET}.s3.${REGION}.amazonaws.com/${KEY}")" "$KEY"
+done
+```
+> A **403** means the policy/BPA is not yet effective. A **404** on the `.run` or a `*.rpm` means those files were never uploaded — they are **not** part of `aws s3 sync` and must be copied separately with `aws s3 cp` (the `.run` to `${PREFIX}/`, the RPMs to `${PREFIX}/bigip-extensions/`).
+
+##### Air-gapped / cannot-make-public alternatives
+
+Public read is the simplest way to satisfy the BIG-IP's unauthenticated download, but it **exposes your artifacts to anyone in the partition** and may violate an air-gapped or otherwise restricted security posture. If you cannot make the bucket public, note these gotchas and alternatives:
+
+- **An S3 Gateway VPC endpoint alone does NOT fix this.** Setting `provisionS3Endpoint=true` gives the BIG-IP a private network path to S3, but the default bootstrap still sends an **unsigned** request, which a private bucket rejects with **403** regardless of the endpoint. The endpoint only helps once the request is **IAM-signed**.
+- **Region must match for the endpoint.** An S3 Gateway endpoint is regional (`com.amazonaws.<region>.s3`) and only routes to buckets in *that* region. Keep the staging bucket, the deployment, and the endpoint in the **same** region, or the BIG-IP will fall back to (blocked) cross-region/internet paths.
+- **Alternative A — IAM-signed pulls (keeps the bucket private).** Scope the bucket policy to the BIG-IP instance role instead of `Principal: "*"`, leave BPA on, deploy the S3 Gateway endpoint, and have the bootstrap fetch the artifacts with **signed** requests (instance-role credentials) rather than the default anonymous `curl`. Fully in-partition, no internet egress, no public exposure. Requires customizing how the runtime-init artifacts are fetched.
+- **Alternative B — Pre-signed URLs.** Generate time-limited pre-signed URLs for the `.run`, the config YAMLs, and the RPMs, and pass them via `bigIpRuntimeInitPackageUrl` / `bigIpRuntimeInitConfig01/02` (and the RPM `extensionUrl`s in the config files). The bucket stays private; the URLs expire, so they must be valid at boot time.
+- **Alternative C — Bake artifacts into a custom AMI.** Build a custom BIG-IP image with `f5-bigip-runtime-init` and the DO/AS3/CF extensions pre-installed and the config staged locally, removing boot-time downloads entirely. Most up-front effort, but the cleanest for repeatable, fully air-gapped deployments.
+
+#### 3. Launch pointing at your GovCloud bucket
+
+Override these parameters (in addition to the usual REQUIRED ones):
+
+| Parameter | Value |
+| --- | --- |
+| **s3BucketName** | `my-org-f5-cft-gov` |
+| **s3BucketRegion** | `us-gov-west-1` |
+| **artifactLocation** | `f5-aws-cloudformation-v2/v3.6.0.0/examples/` *(must end in `/`)* |
+
+```bash
+aws cloudformation create-stack --region us-gov-west-1 --stack-name myFailover \
+  --template-url https://my-org-f5-cft-gov.s3.us-gov-west-1.amazonaws.com/f5-aws-cloudformation-v2/v3.6.0.0/examples/failover/failover.yaml \
+  --parameters \
+    "ParameterKey=s3BucketName,ParameterValue=my-org-f5-cft-gov" \
+    "ParameterKey=s3BucketRegion,ParameterValue=us-gov-west-1" \
+    "ParameterKey=artifactLocation,ParameterValue=f5-aws-cloudformation-v2/v3.6.0.0/examples/" \
+    "ParameterKey=restrictedSrcAddressMgmt,ParameterValue=55.55.55.55/32" \
+    "ParameterKey=restrictedSrcAddressApp,ParameterValue=10.0.0.0/8" \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+**Deploying via the AWS Console (GUI):** the public "Launch Stack" button points at F5's commercial bucket and will **not** work in GovCloud. Instead, in the AWS GovCloud (US) CloudFormation console:
+
+1. Go to **CloudFormation → Create stack → With new resources (standard)**.
+2. Under **Prerequisite - Prepare template**, choose **Choose an existing template**.
+3. Under **Specify template**, choose **Amazon S3 URL** and paste the `failover.yaml` URL from *your* GovCloud bucket. For example:
+   ```
+   https://f5-cft-gov.s3.us-gov-east-1.amazonaws.com/f5-aws-cloudformation-v2/v3.6.0.0/examples/failover/failover.yaml
+   ```
+   The URL pattern is `https://<s3BucketName>.s3.<s3BucketRegion>.amazonaws.com/<artifactLocation>failover/failover.yaml`.
+4. Click **Next** and set the parameters. **Confirm `s3BucketName` / `s3BucketRegion` / `artifactLocation` match the bucket in the URL above** so the nested stacks and BIG-IP artifacts are pulled from your GovCloud bucket too (the template defaults are pre-set to this bucket, but verify them).
+5. On the review page, acknowledge **`CAPABILITY_NAMED_IAM`**. **Stack failure options** can be left at the default (roll back on failure); for a first run in a new environment you may optionally choose **Preserve successfully provisioned resources** as a safety net (see *Clustering does not form / "no trust domain"* under [Troubleshooting Steps](#troubleshooting-steps)). Then create the stack.
+
+> **Region selector = where everything deploys.** The Region you choose in the console's top-right selector (or the `--region` flag on the CLI) determines where *all resources* are created — VPC, BIG-IPs, key pair, EIPs. This is **independent** of the `s3BucketRegion` in the template URL (which only governs where the *template files* are downloaded from). Launch the console in the **same GovCloud Region** you intend to deploy into, and create your EC2 key pair in that same Region.
+
+> **Also repoint BIG-IP artifacts for GovCloud.** The default **bigIpRuntimeInitConfig01/02** and **bigIpRuntimeInitPackageUrl** point to commercial endpoints (`s3.amazonaws.com` / `cdn.f5.com`) that the BIG-IP cannot reach from GovCloud. Host those files in your GovCloud bucket (or another in-partition location reachable from the BIG-IP) and override the parameters accordingly.
+
+> **AMI availability.** Ensure the BIG-IP marketplace image referenced by **bigIpImage** is available and subscribed in your GovCloud region. The AMI-lookup Lambda will correctly report *"AMIs ... have not been found"* if the image/owner is not present in-partition.
 
 
 ### Changing the BIG-IP Deployment
@@ -767,6 +915,50 @@ If you are unable to login to the BIG-IP instance, you can navigate to **EC2 > I
 aws ec2 get-console-output --region ${REGION}  --instance-id <ID>'
 ```
 
+
+### Clustering does not form / "no trust domain" (device trust not established)
+
+**Symptom:** All stacks deploy (or the BIG-IP stack times out), but the pair never clusters. `tmsh show cm sync-status` reports `Status: Unknown`, `Summary: no trust domain`, `Mode: standalone`, and `tmsh list cm trust-domain` is empty. In */var/log/restnoded/restnoded.log* you see repeating:
+
+- `01020036:3: The requested trust domain (/Common/Root) was not found.`
+- `01020036:3: The requested device group (/Common/failoverGroup) was not found.`
+
+**Cause:** This is a documented BIG-IP / Declarative Onboarding behavior — in some cases the local device-trust domain (`/Common/Root`) is **not fully initialized after system startup**, so DO cannot create the trust domain or the failover device group and clustering deadlocks (one device waits for `Root`, the other waits for the device group). See F5's DO troubleshooting: *"Why does BIG-IP cluster fail to form when using Declarative Onboarding..."* — https://clouddocs.f5.com/products/extensions/f5-declarative-onboarding/latest/troubleshooting.html . **This is a platform startup-timing condition — it is not caused by GovCloud, the security groups, the VPC endpoints, or this template.** Device trust and config-sync ran over the **external Self IP** network in testing; the management interface is not used for clustering.
+
+> The runtime-init configs in this solution include a `pre_onboard` readiness wait that holds onboarding until `/Common/Root` initializes, which prevents the race in most cases. If you still hit the symptom above, use the recovery below (F5's documented workaround is *reboot → trust rebuilds automatically → reapply*).
+
+**Recovery (validated):** Replace `<admin-password>` with your Secrets Manager value, `<bigip01-external-self-ip>` with BIG-IP-01's external Self IP (e.g. `10.0.0.11`), and the hostnames with your values (e.g. `failover01.local` / `failover02.local`).
+
+1. **Reboot BOTH instances.** On a clean boot `devmgmtd` rebuilds the default `Root` trust domain; runtime-init is one-shot and will not re-run its failed clustering:
+   ```bash
+   tmsh reboot
+   ```
+2. After both are back, confirm `Root` now exists on each (it should list the local device as a ca-device):
+   ```bash
+   tmsh list cm trust-domain one-line
+   ```
+3. On **BIG-IP-02**, add BIG-IP-01 to the trust domain over its **external Self IP** (not the management IP):
+   ```bash
+   tmsh modify cm trust-domain Root ca-devices add { <bigip01-external-self-ip> } name failover01.local username admin password <admin-password>
+   ```
+   `tmsh list cm trust-domain one-line` should now show **both** devices, status `initialized`.
+4. Create the failover device group and synchronize (run on **BIG-IP-01**, the intended owner):
+   ```bash
+   tmsh create cm device-group failoverGroup type sync-failover
+   tmsh modify cm device-group failoverGroup devices add { failover01.local failover02.local }
+   tmsh modify cm device-group failoverGroup auto-sync enabled network-failover enabled
+   tmsh save sys config
+   tmsh run cm config-sync to-group failoverGroup
+   ```
+   If sync shows `Changes Pending`/`Awaiting Initial Sync`, force the initial push from the device with the authoritative config:
+   ```bash
+   tmsh run cm config-sync force-full-load-push to-group failoverGroup
+   ```
+5. Verify on **both** boxes — expect `Status: In Sync` (green), `Mode: high-availability`:
+   ```bash
+   tmsh show cm sync-status
+   ```
+   Cloud Failover Extension (CFE) then manages failover of the floating/secondary addresses and routes in AWS.
 
 ## Security
 

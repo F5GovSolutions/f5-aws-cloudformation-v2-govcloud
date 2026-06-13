@@ -738,7 +738,7 @@ Resources:
     Condition: createMgmtPublicIP01
     Properties:
       Domain: vpc
-      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::Region']
+      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::NoValue']
       Tags:
         - Key: application
           Value: !Ref application
@@ -760,7 +760,7 @@ Resources:
     Condition: createMgmtPublicIP02
     Properties:
       Domain: vpc
-      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::Region']
+      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::NoValue']
       Tags:
         - Key: application
           Value: !Ref application
@@ -782,7 +782,7 @@ Resources:
     Condition: createMgmtPublicIP03
     Properties:
       Domain: vpc
-      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::Region']
+      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::NoValue']
       Tags:
         - Key: application
           Value: !Ref application
@@ -804,7 +804,7 @@ Resources:
     Condition: createMgmtPublicIP04
     Properties:
       Domain: vpc
-      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::Region']
+      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::NoValue']
       Tags:
         - Key: application
           Value: !Ref application
@@ -826,7 +826,7 @@ Resources:
     Condition: createExternalPublicIP01
     Properties:
       Domain: vpc
-      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::Region']
+      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::NoValue']
       Tags:
         - Key: application
           Value: !Ref application
@@ -848,7 +848,7 @@ Resources:
     Condition: createExternalPublicIP02
     Properties:
       Domain: vpc
-      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::Region']
+      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::NoValue']
       Tags:
         - Key: application
           Value: !Ref application
@@ -870,7 +870,7 @@ Resources:
     Condition: createExternalPublicIP03
     Properties:
       Domain: vpc
-      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::Region']
+      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::NoValue']
       Tags:
         - Key: application
           Value: !Ref application
@@ -904,7 +904,7 @@ Resources:
     Condition: createExternalPublicIP04
     Properties:
       Domain: vpc
-      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::Region']
+      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::NoValue']
       Tags:
         - Key: application
           Value: !Ref application
@@ -938,7 +938,7 @@ Resources:
     Condition: createExternalPublicIP05
     Properties:
       Domain: vpc
-      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::Region']
+      NetworkBorderGroup: !If [useLocalZone, !Ref 'networkBorderGroup', !Ref 'AWS::NoValue']
       Tags:
         - Key: application
           Value: !Ref application
@@ -992,6 +992,24 @@ Resources:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
+          CidrIp: !Ref vpcCidr
+        # BIG-IP Device Service Clustering (DSC) - ConfigSync, network failover, MCP/iQuery,
+        # and connection mirroring between cluster peers (over the external Self IPs).
+        - IpProtocol: tcp
+          FromPort: 4353
+          ToPort: 4353
+          CidrIp: !Ref vpcCidr
+        - IpProtocol: tcp
+          FromPort: 6699
+          ToPort: 6699
+          CidrIp: !Ref vpcCidr
+        - IpProtocol: tcp
+          FromPort: 6123
+          ToPort: 6128
+          CidrIp: !Ref vpcCidr
+        - IpProtocol: udp
+          FromPort: 1026
+          ToPort: 1026
           CidrIp: !Ref vpcCidr
       Tags:
         - Key: application

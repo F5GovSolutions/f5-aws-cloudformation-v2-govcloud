@@ -1,0 +1,133 @@
+#!/bin/bash
+# cluster-heal.sh - self-heal for the documented BIG-IP / Declarative Onboarding
+# device-trust startup-timing bug: /Common/Root is not initialised on first boot,
+# so DO clustering cannot bootstrap (errors "/Common/Root not found" /
+# "/Common/failoverGroup not found") and the pair never clusters. See GOVCLOUD-GUIDE.md.
+#
+# F5's documented workaround is "reboot (Root rebuilds) -> re-apply clustering". This
+# automates it, but does the re-apply as the PROVEN manual recovery rather than via DO,
+# because DO's own clustering deadlocks here (its joiner never runs add-to-trust even
+# once Root exists). Installed by the failover runtime-init pre_onboard hook and run by
+# cron every few minutes. Idempotent, marker-gated (no reboot loops), self-disables
+# once In Sync.
+#
+#   1. In Sync                  -> remove cron, mark done, exit.
+#   2. hostname unset / early   -> wait (don't touch a half-onboarded device).
+#   3. Root MISSING (the bug)   -> save config + reboot ONCE to rebuild Root.
+#   4a. trust not formed:
+#        - JOINER (rendered trust.remoteHost is an IP in the runtime-init log)
+#          -> cluster-heal-trust.py: fetch admin password (Secrets Manager, SigV4 via
+#             instance role) and POST /mgmt/tm/cm/add-to-trust to the peer.
+#        - OWNER (remoteHost is a /Common path) -> wait for the joiner.
+#   4b. trust formed -> elected owner (alphabetically-first device) creates failoverGroup
+#        + force-syncs (plain tmsh, no password); each device acts on any
+#        "Synchronize <me> to group X" recommendation (covers datasync-global-dg).
+set -u
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:$PATH
+S=/config/cluster-heal; mkdir -p "$S"; exec >>"$S/log" 2>&1
+echo "=== $(date) cluster-heal ==="
+RTILOG=/var/log/cloud/bigIpRuntimeInit.log
+
+[ -f "$S/done" ] && { rm -f /etc/cron.d/cluster-heal; exit 0; }
+
+# 1. Cluster healthy -> signal CloudFormation success, then disable self.
+# Because clustering is bootstrapped out-of-band (this script), runtime-init exits
+# non-zero on the clustering DO and its userdata never sends the success signal -- so
+# we send it here once the cluster is actually In Sync. We reuse the SAME rendered
+# "cfn-signal -e 0 --stack ... --resource ... --region ..." command CloudFormation put
+# in the instance userdata (no new AWS calls/permissions). This keeps the DO declaration
+# stock (DO stays the source of truth) and makes the stack succeed only when truly
+# clustered (CREATE_FAILED via the CreationPolicy timeout otherwise).
+if tmsh show cm sync-status 2>/dev/null | grep -qi "in sync"; then
+  echo "cluster In Sync"
+  if [ ! -f "$S/signalled" ]; then
+    SIG=$(grep -ohE '/opt/aws/bin/cfn-signal -e 0 --stack [^ ]+ --resource [^ ]+ --region [^ ]+' \
+          /opt/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt /config/cloud/user_data 2>/dev/null | head -1)
+    if [ -n "$SIG" ]; then
+      echo "signalling CloudFormation success: $SIG"
+      if $SIG; then touch "$S/signalled"; echo "cfn-signal sent OK"; else echo "cfn-signal failed - will retry next tick"; exit 0; fi
+    else
+      echo "WARNING: cfn-signal command not found in userdata - cluster is up but stack relies on its own signal/timeout"
+      touch "$S/signalled"
+    fi
+  fi
+  echo "In Sync + signalled -> disabling self-heal"
+  touch "$S/done"; rm -f /etc/cron.d/cluster-heal; exit 0
+fi
+
+# 2. Don't act until base onboarding has set the hostname
+MYHOST=$(tmsh list sys global-settings hostname 2>/dev/null | awk '/hostname/{print $2}')
+case "$MYHOST" in ""|localhost*|ip-*) echo "hostname not set yet ($MYHOST) - waiting"; exit 0;; esac
+
+# Pre-reboot safety: let the initial onboard run a while before intervening
+if [ ! -f "$S/rebooted" ]; then
+  U=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+  [ "$U" -lt 600 ] && { echo "uptime ${U}s < 600s (pre-reboot guard) - waiting"; exit 0; }
+fi
+
+# 3. Is the local Root trust-domain present?
+if ! tmsh list cm trust-domain Root one-line >/dev/null 2>&1; then
+  if [ ! -f "$S/rebooted" ]; then
+    echo "Root trust-domain MISSING after onboarding -> saving config + rebooting once to rebuild it"
+    tmsh save sys config >/dev/null 2>&1
+    touch "$S/rebooted"
+    reboot
+    exit 0
+  fi
+  U=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+  [ "$U" -lt 240 ] && { echo "post-reboot, waiting for Root to initialise (uptime ${U}s)"; exit 0; }
+  echo "Root STILL missing >4min after reboot - manual recovery needed (see GOVCLOUD-GUIDE.md)"
+  exit 0
+fi
+
+# 4a. Is device trust formed? (peer present => 2+ ca-devices in Root)
+NTRUST=$(tmsh list cm trust-domain Root 2>/dev/null | grep -oE '/Common/[^ }]+\.local' | sort -u | wc -l)
+if [ "${NTRUST:-0}" -lt 2 ]; then
+  # The joiner's rendered trust.remoteHost is an IP (logged by runtime-init). The owner's
+  # is a /Common/... path, so it has no IP here -> the owner just waits for the joiner.
+  PEERIP=$(grep -oE '"remoteHost":"[0-9]{1,3}(\.[0-9]{1,3}){3}"' "$RTILOG" 2>/dev/null | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -1)
+  if [ -z "$PEERIP" ]; then
+    echo "no IP remoteHost in runtime-init log -> I am the owner; waiting for joiner to establish trust"
+    exit 0
+  fi
+  PEERNAME=$(grep -oE '[A-Za-z0-9_-]+\.local' "$RTILOG" 2>/dev/null | sort -u | grep -vx "$MYHOST" | head -1)
+  T=$(cat "$S/trust_tries" 2>/dev/null || echo 0)
+  if [ "$T" -ge 6 ]; then
+    echo "add-to-trust attempted ${T}x, trust still not formed - manual recovery needed (see GOVCLOUD-GUIDE.md)"
+    exit 0
+  fi
+  echo $((T+1)) > "$S/trust_tries"
+  echo "JOINER -> add-to-trust peer=${PEERIP} name=${PEERNAME} (attempt $((T+1)))"
+  python3 /config/cluster-heal-trust.py "$PEERIP" "$PEERNAME"
+  echo "add-to-trust attempt complete; re-check next tick"
+  exit 0
+fi
+
+# 4b. Trust formed. Ensure failoverGroup + sync via plain tmsh (no password).
+# Elect owner = alphabetically-first device name; only the owner creates the group.
+OWNER=$(tmsh list cm device one-line 2>/dev/null | awk '{print $3}' | sort | head -1)
+if ! tmsh list cm device-group failoverGroup one-line >/dev/null 2>&1; then
+  if [ "$MYHOST" = "$OWNER" ]; then
+    DEVS=$(tmsh list cm device one-line 2>/dev/null | awk '{print $3}' | tr '\n' ' ')
+    echo "trust formed; I am owner ($OWNER) -> creating failoverGroup with: $DEVS"
+    tmsh create cm device-group failoverGroup type sync-failover 2>/dev/null
+    tmsh modify cm device-group failoverGroup devices add { $DEVS } 2>/dev/null
+    tmsh modify cm device-group failoverGroup auto-sync enabled network-failover enabled 2>/dev/null
+    tmsh save sys config >/dev/null 2>&1
+    sleep 5
+    tmsh run cm config-sync force-full-load-push to-group failoverGroup 2>/dev/null
+    echo "failoverGroup created + force-pushed; waiting for In Sync"
+  else
+    echo "trust formed; waiting for owner ($OWNER) to create failoverGroup"
+  fi
+  exit 0
+fi
+
+# device-group exists but not yet In Sync. Act on any sync recommendation for THIS device
+# (covers datasync-global-dg / datasync-device groups; direction-correct).
+tmsh show cm sync-status 2>/dev/null | grep -i "Synchronize this device to group" | while read -r line; do
+  GRP=$(echo "$line" | sed -n 's/.*to group \([A-Za-z0-9_.-]*\).*/\1/p')
+  [ -n "$GRP" ] && { echo "recommended: sync this device -> ${GRP}"; tmsh run cm config-sync to-group "$GRP" 2>/dev/null; }
+done
+echo "failoverGroup exists, waiting for In Sync"
+exit 0

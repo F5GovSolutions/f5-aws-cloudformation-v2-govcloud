@@ -1100,7 +1100,7 @@ Resources:
     CreationPolicy:
       ResourceSignal:
         Count: 1
-        Timeout: PT30M
+        Timeout: PT50M
     Condition: is3Nic
     Properties:
       BlockDeviceMappings:
@@ -1163,6 +1163,8 @@ Resources:
           Value: !Ref 'bigIpPeerHostname'
         - Key: failoverTag
           Value: !Ref 'cfeTag'
+        - Key: cfeStorageName
+          Value: !Sub '${cfeS3Bucket}.s3.${AWS::Region}.amazonaws.com'
         - Key: hostname
           Value: !Ref 'hostname'
         - Key: vip1Addr
@@ -1364,7 +1366,7 @@ Resources:
     CreationPolicy:
       ResourceSignal:
         Count: 1
-        Timeout: PT30M
+        Timeout: PT50M
     Condition: is2Nic
     Properties:
       BlockDeviceMappings:
@@ -1421,6 +1423,8 @@ Resources:
           Value: !Ref 'bigIpPeerHostname'
         - Key: failoverTag
           Value: !Ref 'cfeTag'
+        - Key: cfeStorageName
+          Value: !Sub '${cfeS3Bucket}.s3.${AWS::Region}.amazonaws.com'
         - Key: hostname
           Value: !Ref 'hostname'
         - Key: vip1Addr
@@ -1622,7 +1626,7 @@ Resources:
     CreationPolicy:
       ResourceSignal:
         Count: 1
-        Timeout: PT30M
+        Timeout: PT50M
     Condition: is1Nic
     Properties:
       BlockDeviceMappings:
@@ -1673,6 +1677,8 @@ Resources:
           Value: !Ref 'bigIpPeerHostname'
         - Key: failoverTag
           Value: !Ref 'cfeTag'
+        - Key: cfeStorageName
+          Value: !Sub '${cfeS3Bucket}.s3.${AWS::Region}.amazonaws.com'
         - Key: hostname
           Value: !Ref 'hostname'
         - Key: vip1Addr

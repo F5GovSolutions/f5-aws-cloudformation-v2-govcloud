@@ -19,6 +19,7 @@ Metadata:
           - numSubnets
           - subnetMask
           - vpcCidr
+          - provisionS3Endpoint
           - bigIpMgmtAddress01
           - bigIpExternalSelfIp01
           - bigIpExternalVip01
@@ -37,6 +38,9 @@ Metadata:
           default: DAG / Ingress
         Parameters:
           - provisionPublicIpMgmt
+          - provisionExternalVip
+          - provisionPublicIpVip
+          - provisionPublicIpExternalSelf
           - restrictedSrcAddressMgmt
           - restrictedSrcAddressApp
       - Label:
@@ -147,6 +151,14 @@ Metadata:
         default: Provision Example App
       provisionPublicIpMgmt:
         default: Provision Public IP addresses for the BIG-IP management interface
+      provisionExternalVip:
+        default: Provision an external floating traffic VIP
+      provisionPublicIpVip:
+        default: Provision a Public IP address for the BIG-IP external VIP
+      provisionPublicIpExternalSelf:
+        default: Provision Public IP addresses for the BIG-IP external Self IPs
+      provisionS3Endpoint:
+        default: Provision VPC endpoints for air-gapped deployments (S3 + EC2 + Secrets Manager)
       restrictedSrcAddressApp:
         default: Restricted Source Address to Application
       restrictedSrcAddressMgmt:
@@ -261,7 +273,7 @@ Parameters:
     AllowedValues:
       - 'true'
       - 'false'
-    Default: 'true'
+    Default: 'false'
     Description: This deployment can send anonymous statistics to F5 to help us determine
       how to improve our solutions. If you select **false** statistics are not sent.
     Type: String
@@ -303,7 +315,7 @@ Parameters:
     Type: String
   bigIpImage:
     ConstraintDescription: Must be a valid F5 BIG-IP market place image
-    Default: '*17.1.1-0.2.6**PAYG-Best Plus 25Mbps*'
+    Default: '*17.5.1.6-0.0.25*PAYG-Best Plus 25Mbps*'
     Description: F5 BIG-IP market place image
     Type: String
   bigIpInstanceProfile:
@@ -335,18 +347,21 @@ Parameters:
       IP address.
     Type: String
   bigIpRuntimeInitConfig01:
-    Default: 'https://f5-cft-v2.s3.amazonaws.com/f5-aws-cloudformation-v2/v3.6.0.0/examples/failover/bigip-configurations/runtime-init-conf-3nic-payg-instance01-with-app.yaml'
-    Description: 'REQUIRED - Supply a URL to the bigip-runtime-init configuration
-      file in YAML or JSON format to use for f5-bigip-runtime-init configuration.'
+    Default: ''
+    Description: 'Supply a URL to the bigip-runtime-init configuration file (YAML/JSON)
+      for BIG-IP instance 01. Leave blank to auto-derive from s3BucketName /
+      s3BucketRegion / artifactLocation (the staged config in your bucket).'
     Type: String
   bigIpRuntimeInitConfig02:
-    Default: 'https://f5-cft-v2.s3.amazonaws.com/f5-aws-cloudformation-v2/v3.6.0.0/examples/failover/bigip-configurations/runtime-init-conf-3nic-payg-instance02-with-app.yaml'
-    Description: 'REQUIRED - Supply a URL to the bigip-runtime-init configuration
-      file in YAML or JSON format to use for f5-bigip-runtime-init configuration.'
+    Default: ''
+    Description: 'Supply a URL to the bigip-runtime-init configuration file (YAML/JSON)
+      for BIG-IP instance 02. Leave blank to auto-derive from s3BucketName /
+      s3BucketRegion / artifactLocation (the staged config in your bucket).'
     Type: String
   bigIpRuntimeInitPackageUrl:
-    Default: 'https://cdn.f5.com/product/cloudsolutions/f5-bigip-runtime-init/v2.0.3/dist/f5-bigip-runtime-init-2.0.3-1.gz.run'
-    Description: URL for BIG-IP Runtime Init package.
+    Default: ''
+    Description: URL for the BIG-IP Runtime Init package. Leave blank to auto-derive from
+      s3BucketName / s3BucketRegion / artifactLocation (the staged package in your bucket).
     Type: String
   cfeS3Bucket:
     AllowedPattern: '^$|^(?=.{1,61}$)[0-9a-z]+([0-9a-z-.]*[0-9a-z])*$'
@@ -462,8 +477,28 @@ Parameters:
     AllowedValues:
       - 'true'
       - 'false'
-    Default: 'true'
+    Default: 'false'
     Description: Flag to deploy the demo web application.
+    Type: String
+  provisionExternalVip:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: Whether or not to provision an external floating traffic VIP (a secondary
+      private IP that Cloud Failover Extension moves between BIG-IPs on failover). Set
+      to false to deploy with Self IPs only. Combine with provisionPublicIpVip=false for
+      a private (no public EIP) floating VIP, e.g. air-gapped deployments.
+    Type: String
+  provisionPublicIpExternalSelf:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: Whether or not to provision a public IP address (EIP) on each BIG-IP
+      external Self IP. Set to false to keep the external Self IPs private (no EIP) and
+      reduce the number of Elastic IPs consumed, e.g. air-gapped deployments. Note that
+      a public VIP (provisionPublicIpVip=true) requires public external Self IPs.
     Type: String
   provisionPublicIpMgmt:
     AllowedValues:
@@ -472,6 +507,27 @@ Parameters:
     Default: 'true'
     Description: Whether or not to provision public IP addresses for the BIG-IP management
       network interfaces.
+    Type: String
+  provisionPublicIpVip:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: Whether or not to provision a public IP address (EIP) on the BIG-IP
+      external traffic VIP. Set to false for private-only / air-gapped deployments.
+      Independent of provisionExampleApp (the demo app toggle).
+    Type: String
+  provisionS3Endpoint:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+    Description: Value of true provisions the VPC endpoints required for air-gapped /
+      no-egress deployments - an S3 Gateway endpoint (Cloud Failover state storage and
+      runtime-init artifacts) plus EC2, Secrets Manager, and CloudFormation Interface
+      endpoints (Cloud Failover Extension API calls, secret retrieval, and the BIG-IP
+      cfn-signal stack-success signal). Required when the BIG-IP dataplane has no internet
+      egress (e.g. provisionPublicIpExternalSelf=false), or CFE init and the stack signal fail.
     Type: String
   restrictedSrcAddressMgmt:
     AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
@@ -494,14 +550,14 @@ Parameters:
     ConstraintDescription: >-
       S3 bucket name can include numbers, lowercase letters, uppercase letters, and
       hyphens (-). It cannot start or end with a hyphen (-).
-    Default: f5-cft-v2
+    Default: f5-cft-gov
     Description: >-
       REQUIRED - S3 bucket name for the modules. S3 bucket name can include numbers,
       lowercase letters, uppercase letters, and hyphens (-). It cannot start or end
       with a hyphen (-).
     Type: String
   s3BucketRegion:
-    Default: us-east-1
+    Default: us-gov-east-1
     Description: The AWS Region where the Quick Start S3 bucket (s3BucketName) is
       hosted. When using your own bucket, you must specify this value.
     Type: String
@@ -570,9 +626,32 @@ Conditions:
   usePublicIpMgmt: !Equals
     - 'true'
     - !Ref 'provisionPublicIpMgmt'
-  usePublicIpVip: !Equals
+  useExternalVip: !Equals
+    - 'true'
+    - !Ref 'provisionExternalVip'
+  usePublicIpVip: !And
+    - !Condition useExternalVip
+    - !Equals
+      - 'true'
+      - !Ref 'provisionPublicIpVip'
+  useExternalSelfPublicIp: !Equals
+    - 'true'
+    - !Ref 'provisionPublicIpExternalSelf'
+  createExternalSelfEip: !Or
+    - !Condition useExternalSelfPublicIp
+    - !Condition usePublicIpVip
+  deployExampleApp: !Equals
     - 'true'
     - !Ref 'provisionExampleApp'
+  useDefaultRuntimeInitConfig01: !Equals
+    - !Ref 'bigIpRuntimeInitConfig01'
+    - ''
+  useDefaultRuntimeInitConfig02: !Equals
+    - !Ref 'bigIpRuntimeInitConfig02'
+    - ''
+  useDefaultRuntimeInitPackage: !Equals
+    - !Ref 'bigIpRuntimeInitPackageUrl'
+    - ''
 Resources:
   Access:
     Type: 'AWS::CloudFormation::Stack'
@@ -612,7 +691,7 @@ Resources:
       ServiceToken: !GetAtt [Function, Outputs.lambdaARN]
   Application:
     Type: 'AWS::CloudFormation::Stack'
-    Condition: usePublicIpVip
+    Condition: deployExampleApp
     Properties:
       TemplateURL: !Sub
         - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/application/application.yaml'
@@ -620,26 +699,15 @@ Resources:
           S3Bucket: !Ref 's3BucketName'
       Parameters:
         appContainerName: !Ref 'appDockerImageName'
-        applicationSubnet: !If
-          - usePublicIpVip
-          - !Join
-            - ','
-            - - !Select
-                - '3'
-                - !Split
-                  - ','
-                  - !GetAtt
-                    - Network
-                    - Outputs.subnetsA
-          - !Join
-            - ','
-            - - !Select
-                - '4'
-                - !Split
-                  - ','
-                  - !GetAtt
-                    - Network
-                    - Outputs.subnetsA
+        applicationSubnet: !Join
+          - ','
+          - - !Select
+              - '3'
+              - !Split
+                - ','
+                - !GetAtt
+                  - Network
+                  - Outputs.subnetsA
         appSecurityGroupId: !GetAtt [Dag, Outputs.appSecurityGroupId]
         sshKey: !If [createKeyPair, !GetAtt [Access, Outputs.keyPairName], !Ref 'sshKey']
         restrictedSrcAddress: !Ref 'restrictedSrcAddressApp'
@@ -695,8 +763,20 @@ Resources:
         allowUsageAnalytics: !Ref 'allowUsageAnalytics'
         bigIpPeerAddr: !Ref 'bigIpPeerAddr'
         bigIpPeerHostname: !Ref 'bigIpHostname02'
-        bigIpRuntimeInitPackageUrl: !Ref 'bigIpRuntimeInitPackageUrl'
-        bigIpRuntimeInitConfig: !Ref 'bigIpRuntimeInitConfig01'
+        bigIpRuntimeInitPackageUrl: !If
+          - useDefaultRuntimeInitPackage
+          - !Sub
+            - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}f5-bigip-runtime-init-2.0.3-1.gz.run'
+            - S3Region: !Ref 's3BucketRegion'
+              S3Bucket: !Ref 's3BucketName'
+          - !Ref 'bigIpRuntimeInitPackageUrl'
+        bigIpRuntimeInitConfig: !If
+          - useDefaultRuntimeInitConfig01
+          - !Sub
+            - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}failover/bigip-configurations/runtime-init-conf-3nic-payg-instance01-with-app.yaml'
+            - S3Region: !Ref 's3BucketRegion'
+              S3Bucket: !Ref 's3BucketName'
+          - !Ref 'bigIpRuntimeInitConfig01'
         cfeS3Bucket: !If
           - useDefaultCfeS3Bucket
           - !Join
@@ -705,32 +785,21 @@ Resources:
               - '-bigip-high-availability-solution'
           - !Ref 'cfeS3Bucket'
         cfeTag: !Ref 'cfeTag'
-        externalSelfPublicIpId: !GetAtt [Dag, Outputs.bigIpExternalEipAllocationId01]
+        externalSelfPublicIpId: !If [createExternalSelfEip, !GetAtt [Dag, Outputs.bigIpExternalEipAllocationId01], '']
         externalServicePublicIpIds: !If [usePublicIpVip, !GetAtt [Dag, Outputs.bigIpExternalEipAllocationId03],
           '']
         externalSecurityGroupId: !GetAtt [Dag, Outputs.bigIpExternalSecurityGroup]
         externalSelfIp: !Ref 'bigIpExternalSelfIp01'
-        externalServiceIps: !If [usePublicIpVip, !Ref 'bigIpExternalVip01', '']
-        externalSubnetId: !If
-          - usePublicIpVip
-          - !Join
-            - ','
-            - - !Select
-                - '0'
-                - !Split
-                  - ','
-                  - !GetAtt
-                    - Network
-                    - Outputs.subnetsA
-          - !Join
-            - ','
-            - - !Select
-                - '3'
-                - !Split
-                  - ','
-                  - !GetAtt
-                    - Network
-                    - Outputs.subnetsA
+        externalServiceIps: !If [useExternalVip, !Ref 'bigIpExternalVip01', '']
+        externalSubnetId: !Join
+          - ','
+          - - !Select
+              - '0'
+              - !Split
+                - ','
+                - !GetAtt
+                  - Network
+                  - Outputs.subnetsA
         hostname: !Ref 'bigIpHostname01'
         imageId: !If
           - noCustomImageId
@@ -776,7 +845,7 @@ Resources:
                   - Network
                   - Outputs.subnetsA
         numExternalPublicIpAddresses: !If [usePublicIpVip, 2, 1]
-        numSecondaryPrivateIpAddresses: !If [usePublicIpVip, 1, 0]
+        numSecondaryPrivateIpAddresses: !If [useExternalVip, 1, 0]
         secretArn: !If [createSecret, !GetAtt [Access, Outputs.secretArn], !Ref 'bigIpSecretArn']
         sshKey: !If [createKeyPair, !GetAtt [Access, Outputs.keyPairName], !Ref 'sshKey']
         uniqueString: !Ref 'uniqueString'
@@ -796,32 +865,34 @@ Resources:
         allowUsageAnalytics: !Ref 'allowUsageAnalytics'
         bigIpPeerAddr: !Ref 'bigIpPeerAddr'
         bigIpPeerHostname: !Ref 'bigIpHostname01'
-        bigIpRuntimeInitPackageUrl: !Ref 'bigIpRuntimeInitPackageUrl'
-        bigIpRuntimeInitConfig: !Ref 'bigIpRuntimeInitConfig02'
+        bigIpRuntimeInitPackageUrl: !If
+          - useDefaultRuntimeInitPackage
+          - !Sub
+            - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}f5-bigip-runtime-init-2.0.3-1.gz.run'
+            - S3Region: !Ref 's3BucketRegion'
+              S3Bucket: !Ref 's3BucketName'
+          - !Ref 'bigIpRuntimeInitPackageUrl'
+        bigIpRuntimeInitConfig: !If
+          - useDefaultRuntimeInitConfig02
+          - !Sub
+            - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}failover/bigip-configurations/runtime-init-conf-3nic-payg-instance02-with-app.yaml'
+            - S3Region: !Ref 's3BucketRegion'
+              S3Bucket: !Ref 's3BucketName'
+          - !Ref 'bigIpRuntimeInitConfig02'
         cfeTag: !Ref 'cfeTag'
-        externalSelfPublicIpId: !GetAtt [Dag, Outputs.bigIpExternalEipAllocationId02]
+        externalSelfPublicIpId: !If [createExternalSelfEip, !GetAtt [Dag, Outputs.bigIpExternalEipAllocationId02], '']
         externalServicePublicIpIds: ''
         externalSecurityGroupId: !GetAtt [Dag, Outputs.bigIpExternalSecurityGroup]
         externalSelfIp: !Ref 'bigIpExternalSelfIp02'
-        externalServiceIps: !If [usePublicIpVip, !Ref 'bigIpExternalVip02', '']
-        externalSubnetId: !If
-          - usePublicIpVip
-          - !Join
-            - ','
-            - - !Select
-                - '0'
-                - !Split
-                  - ','
-                  - !If [sameAz, !GetAtt [Network, Outputs.subnetsA], !GetAtt [Network,
-                      Outputs.subnetsB]]
-          - !Join
-            - ','
-            - - !Select
-                - '3'
-                - !Split
-                  - ','
-                  - !If [sameAz, !GetAtt [Network, Outputs.subnetsA], !GetAtt [Network,
-                      Outputs.subnetsB]]
+        externalServiceIps: !If [useExternalVip, !Ref 'bigIpExternalVip02', '']
+        externalSubnetId: !Join
+          - ','
+          - - !Select
+              - '0'
+              - !Split
+                - ','
+                - !If [sameAz, !GetAtt [Network, Outputs.subnetsA], !GetAtt [Network,
+                    Outputs.subnetsB]]
         hostname: !Ref 'bigIpHostname02'
         imageId: !If
           - noCustomImageId
@@ -865,7 +936,7 @@ Resources:
                 - !If [sameAz, !GetAtt [Network, Outputs.subnetsA], !GetAtt [Network,
                     Outputs.subnetsB]]
         numExternalPublicIpAddresses: 1
-        numSecondaryPrivateIpAddresses: !If [usePublicIpVip, 1, 0]
+        numSecondaryPrivateIpAddresses: !If [useExternalVip, 1, 0]
         secretArn: !If [createSecret, !GetAtt [Access, Outputs.secretArn], !Ref 'bigIpSecretArn']
         sshKey: !If [createKeyPair, !GetAtt [Access, Outputs.keyPairName], !Ref 'sshKey']
         uniqueString: !Ref 'uniqueString'
@@ -889,7 +960,7 @@ Resources:
         createBastionSecurityGroup: !If [usePublicIpMgmt, false, true]
         cfeTag: !Ref 'cfeTag'
         cfeVipTag: !Ref 'cfeVipTag'
-        numberPublicExternalIpAddresses: !If [usePublicIpVip, 3, 2]
+        numberPublicExternalIpAddresses: !If [usePublicIpVip, 3, !If [useExternalSelfPublicIp, 2, 0]]
         numberPublicMgmtIpAddresses: !If [usePublicIpMgmt, 2, 0]
         provisionExternalBigipLoadBalancer: false
         provisionInternalBigipLoadBalancer: false
@@ -935,6 +1006,7 @@ Resources:
         numAzs: !Ref 'numAzs'
         numSubnets: !Ref 'numSubnets'
         setPublicSubnet1: !Ref 'provisionPublicIpMgmt'
+        provisionS3Endpoint: !Ref 'provisionS3Endpoint'
         subnetMask: !Ref 'subnetMask'
         uniqueString: !Ref 'uniqueString'
         vpcCidr: !Ref 'vpcCidr'

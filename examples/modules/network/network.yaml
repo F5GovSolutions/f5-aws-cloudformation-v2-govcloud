@@ -8,6 +8,9 @@ Conditions:
   usEast1: !Equals
     - !Ref 'AWS::Region'
     - us-east-1
+  deployS3Endpoint: !Equals
+    - !Ref 'provisionS3Endpoint'
+    - 'true'
   az2: !Or
     - !Equals
       - !Ref numAzs
@@ -477,6 +480,13 @@ Parameters:
     Default: f5owner
     Description: Owner Tag.
     Type: String
+  provisionS3Endpoint:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+    Description: Value of true provisions the VPC endpoints required for air-gapped / no-egress deployments - an S3 Gateway endpoint (Cloud Failover state storage, runtime-init artifacts) plus EC2, Secrets Manager, and CloudFormation Interface endpoints (Cloud Failover Extension API calls, secret retrieval, and the BIG-IP cfn-signal stack-success signal). Required when the BIG-IP dataplane has no internet egress (e.g. provisionPublicIpExternalSelf=false), or CFE initialization and the CloudFormation success signal will fail.
+    Type: String
   setPublicSubnet1:
     AllowedValues:
       - 'true'
@@ -596,6 +606,92 @@ Resources:
     Properties:
       VpcId: !Ref vpc
       InternetGatewayId: !Ref internetGateway
+  s3VpcEndpoint:
+    Condition: deployS3Endpoint
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref vpc
+      RouteTableIds:
+        - !Ref publicSubnetRouteTable
+        - !If [naclPrivateA, !Ref privateRouteTableA, !Ref 'AWS::NoValue']
+        - !If [naclPrivateB, !Ref privateRouteTableB, !Ref 'AWS::NoValue']
+        - !If [naclPrivateC, !Ref privateRouteTableC, !Ref 'AWS::NoValue']
+        - !If [naclPrivateD, !Ref privateRouteTableD, !Ref 'AWS::NoValue']
+  vpcEndpointSecurityGroup:
+    Condition: deployS3Endpoint
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'HTTPS (443) to interface VPC endpoints (EC2, Secrets Manager) for air-gapped / no-egress BIG-IP API access'
+      VpcId: !Ref vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref vpcCidr
+      Tags:
+        - Key: Name
+          Value: !Join ['', [!Ref uniqueString, '-vpce-sg']]
+        - Key: application
+          Value: !Ref application
+        - Key: costcenter
+          Value: !Ref cost
+        - Key: environment
+          Value: !Ref environment
+        - Key: group
+          Value: !Ref group
+        - Key: owner
+          Value: !Ref owner
+  ec2VpcEndpoint:
+    Condition: deployS3Endpoint
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2'
+      VpcId: !Ref vpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref vpcEndpointSecurityGroup
+      SubnetIds:
+        - !Ref subnet0A
+        - !If [az2, !Ref subnet0B, !Ref 'AWS::NoValue']
+        - !If [az3, !Ref subnet0C, !Ref 'AWS::NoValue']
+        - !If [az4, !Ref subnet0D, !Ref 'AWS::NoValue']
+  secretsManagerVpcEndpoint:
+    Condition: deployS3Endpoint
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcId: !Ref vpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref vpcEndpointSecurityGroup
+      SubnetIds:
+        - !Ref subnet0A
+        - !If [az2, !Ref subnet0B, !Ref 'AWS::NoValue']
+        - !If [az3, !Ref subnet0C, !Ref 'AWS::NoValue']
+        - !If [az4, !Ref subnet0D, !Ref 'AWS::NoValue']
+  cloudFormationVpcEndpoint:
+    # Lets the BIG-IP reach the CloudFormation API privately to send its
+    # cfn-signal (CreationPolicy success) when there is no dataplane internet
+    # egress. Without this, cfn-signal cannot reach cloudformation.<region>.
+    # amazonaws.com and the stack would time out to CREATE_FAILED.
+    Condition: deployS3Endpoint
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.cloudformation'
+      VpcId: !Ref vpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref vpcEndpointSecurityGroup
+      SubnetIds:
+        - !Ref subnet0A
+        - !If [az2, !Ref subnet0B, !Ref 'AWS::NoValue']
+        - !If [az3, !Ref subnet0C, !Ref 'AWS::NoValue']
+        - !If [az4, !Ref subnet0D, !Ref 'AWS::NoValue']
   subnet0A:
     DependsOn: ipv6CidrBlock
     Type: 'AWS::EC2::Subnet'
