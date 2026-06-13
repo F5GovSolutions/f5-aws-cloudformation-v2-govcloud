@@ -6,6 +6,8 @@ This guide is written for a **first-time** operator. It assumes you can use the 
 
 > This is a standalone companion to the main [`README.md`](./README.md). The README is the authoritative parameter and architecture reference; this guide is the start-to-finish GovCloud walkthrough for a single HA setup with CFE. It has automated VPC Endpoints built-in, this has always been a requirement in air-gapped environments where internet egress is not allowed.
 
+> ⚠️ **Scope — what is GovCloud-ready today.** The GovCloud adaptation (staged-bucket defaults, the CloudFormation/EC2/Secrets Manager/S3 VPC endpoints, the clustering self-heal, and the bumped extensions) currently applies to **this one solution: the failover active/standby pair using the 3-NIC PAYG runtime-init config** (`runtime-init-conf-3nic-payg-instance01/02-with-app.yaml`). The repo's **other** solutions — **autoscale**, the **quickstart** standalone, and the other failover variants (**2-NIC**, **BYOL**, and the non-`-with-app` configs) — are **not yet** GovCloud-enabled or validated; they still carry the upstream configuration. Adapting them is planned future work and would follow the same pattern documented here.
+
 ---
 
 ## 1. What you are deploying, and why GovCloud is different
