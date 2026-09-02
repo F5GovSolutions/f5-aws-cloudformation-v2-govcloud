@@ -289,12 +289,19 @@ If your environment has internet egress (NAT/IGW), you can skip most of this and
 | Parameter | Air-gap value | Effect |
 | --- | --- | --- |
 | `provisionPublicIpMgmt` | `true` (or `false` + bastion) | Public EIP on the BIG-IP management interface so you can reach the GUI/SSH. Set `false` to use a bastion only. |
-| `provisionPublicIpExternalSelf` | `false` | No EIP on the external Self IPs (saves 2 EIPs). |
+| `provisionPublicIpExternalSelf` | `false` | No EIP on the external Self IPs (saves 2 EIPs). Only honoured when `provisionPublicIpVip=false` — a public VIP requires public external Self IPs, so with `provisionPublicIpVip=true` both self EIPs are created regardless of this setting. |
 | `provisionExternalVip` | `true` | A floating application VIP exists. |
-| `provisionPublicIpVip` | `false` | The VIP is **private** (no public EIP) — air-gap. |
+| `provisionPublicIpVip` | `false` | The VIP is **private** (no public EIP) — air-gap. ⚠️ **Across two AZs this also means no VIP failover** — the private VIP cannot move between subnets. See [§13](#13-vip-failover-across-availability-zones). |
 | **`provisionS3Endpoint`** | **`true`** | **Required for air-gap.** Provisions the S3 Gateway endpoint **and** the EC2, Secrets Manager, and CloudFormation **interface** endpoints the BIG-IPs need privately. |
 | `provisionExampleApp` | `false` (default) | The demo app pool member needs Docker Hub egress; off by default. |
 | `allowUsageAnalytics` | `false` (default) | No phone-home telemetry. |
+
+> ### ⚠️ `provisionPublicIpVip=false` disables VIP failover — read §13
+> This solution deploys the two BIG-IPs into **different Availability Zones**, and therefore different subnets. A secondary private IP belongs to its subnet's CIDR and **cannot be reassigned to an ENI in another subnet** — so across AZs, CFE's `failoverAddresses` works by moving an **EIP association** between each AZ's VIP address, not by moving the private IP itself.
+>
+> With `provisionPublicIpVip=false` there is no EIP, so **CFE has nothing to move.** The stack deploys, the cluster forms, `cloud-failover/inspect` looks healthy — and the VIP silently never fails over.
+>
+> This is not a defect; it is the consequence of a private VIP across AZs. The air-gap answer is **route-based failover** ([§13](#13-vip-failover-across-availability-zones)), which requires no public addressing at all.
 
 > ### Why `provisionS3Endpoint=true` is mandatory for air-gap
 > Once you turn **off** the external Self IP EIPs, the BIG-IP dataplane has no internet path. Four things then break without VPC endpoints:
@@ -381,6 +388,22 @@ curl -sku admin:'YOUR-PASSWORD' https://localhost/mgmt/shared/cloud-failover/ins
 ```
 A populated response (instance, addresses, trafficGroup) means CFE can move the floating addresses/routes on failover.
 
+Two fields are worth reading rather than skimming:
+
+- **`addresses`** — if the VIP appears here with **different subnets on each device**, the private VIP cannot fail over between them. That is expected across AZs; see [§13](#13-vip-failover-across-availability-zones).
+- **`routes`** — `[]` means CFE is managing no routes. Fine if you are using EIP-based failover (`provisionPublicIpVip=true`); a problem if you have a private VIP across AZs, because then **nothing is configured that can move**.
+
+Confirm which case you are in:
+
+```bash
+aws ec2 describe-network-interfaces --region "$REGION" \
+  --filters "Name=tag:f5_cloud_failover_label,Values=bigip_high_availability_solution" \
+  --query 'NetworkInterfaces[].[NetworkInterfaceId,AvailabilityZone,SubnetId,PrivateIpAddresses[].PrivateIpAddress]' \
+  --output json
+```
+
+Same `SubnetId` for both external ENIs → the secondary IP can relocate. Different subnets → you need [§13](#13-vip-failover-across-availability-zones).
+
 ---
 
 ## 12. Automatic clustering recovery (the self-heal)
@@ -434,7 +457,187 @@ The CloudFormation signal in steps 1/6 is why **`provisionS3Endpoint=true` also 
 
 ---
 
-## 13. Parameter reference
+## 13. VIP failover across Availability Zones
+
+This solution places the two BIG-IPs in **two Availability Zones**, which means two different external subnets. That has a consequence for the application VIP that is easy to miss until the day you actually test a failover.
+
+### 13.1 Why the private VIP cannot move
+
+The template gives each BIG-IP its own external Self IP and a **secondary private IP** on the same ENI — the application VIP. A typical deployment looks like this:
+
+| BIG-IP | AZ | External subnet | Self IP | VIP (secondary) |
+|---|---|---|---|---|
+| failover01 | `us-gov-east-1a` | `subnet-…ae19d` | `10.0.0.11` | `10.0.0.101` |
+| failover02 | `us-gov-east-1b` | `subnet-…7a04c` | `10.0.4.11` | `10.0.4.101` |
+
+A secondary private IP is an address **out of its own subnet's CIDR**. AWS will reject any attempt to assign `10.0.0.101` to an ENI in `subnet-…7a04c` — the address does not belong to that subnet. **No CFE setting, IAM policy, or tag changes this.** It is an AWS constraint, not a BIG-IP one.
+
+So the two VIP addresses above are not one floating address. They are **two independent per-AZ addresses**, and CFE's `failoverAddresses` bridges them by moving the **Elastic IP association** from one to the other. The EIP is what floats; the private IPs stay where they are.
+
+Which is why `provisionPublicIpVip=false` — correct for air-gap in every other respect — leaves you with a healthy-looking HA pair whose VIP never moves.
+
+### 13.2 The two supported options
+
+| | **EIP-based** (`failoverAddresses`) | **Route-based** (`failoverRoutes`) |
+|---|---|---|
+| What CFE moves | The EIP association between the per-AZ VIPs | The **target ENI** of a route table entry |
+| VIP address | In-VPC, one per AZ, plus an EIP | **One address outside the VPC CIDR** |
+| Public IP required | **Yes** — one EIP | **No** |
+| Air-gap suitable | No | **Yes** |
+| Set by | `provisionPublicIpVip=true` | Manual config — see [§13.4](#134-configuring-it) |
+| Convergence | Faster (ENI/EIP reassociation) | Slower (route table update) |
+| AWS API used at failover | `AssociateAddress` | `ReplaceRoute` |
+
+**For a demo or any deployment with internet egress**, set `provisionPublicIpVip=true` and stop reading — it works with the CFE declaration the template already ships.
+
+**For air-gap**, use route-based failover.
+
+> ### BYOIP is not the answer here
+> A reasonable first instinct is "if we can't use AWS public IPs, we'll bring our own with BYOIP." **BYOIP solves a different problem.** It lets you use address space *you already own* as AWS public IPs — you still need internet-routable addresses, a signed ROA, and a multi-step onboarding process. In an air-gapped VPC there is no Internet Gateway for an EIP to attach to at all, so BYOIP buys you nothing. Route-based failover is the supported mechanism and needs no public addressing whatsoever.
+
+### 13.3 How route-based failover works
+
+The VIP moves **outside the VPC CIDR** — an "alien" address. If the VPC is `10.0.0.0/16`, pick something like `10.99.0.0/24` for VIPs.
+
+Because that prefix is not part of the VPC, AWS has no implicit route for it, so a route table entry is required — and that entry's target is an ENI:
+
+```
+Route table (tagged f5_cloud_failover_label)
+  Destination        Target
+  10.99.0.0/24  →  eni-030ec578bd7419ee1     ← failover01's external ENI
+```
+
+A client in the VPC sends to `10.99.0.100`, the subnet route table points at the active BIG-IP's ENI, and the BIG-IP answers because it has a virtual server on that address. **On failover, CFE rewrites the route's target to the peer's ENI.** One API call, no addressing changes anywhere else.
+
+This is entirely private and works with **zero internet egress**. The EC2 API call CFE makes (`ReplaceRoute`) is already served by the EC2 interface endpoint that `provisionS3Endpoint=true` provisions ([§9](#9-air-gap-choose-your-public-ip-toggles-and-endpoints)).
+
+### 13.4 Configuring it
+
+> ### ⚠️ Not yet lab-validated — read before you rely on this
+> The diagnosis in [§13.1](#131-why-the-private-vip-cannot-move)–[§13.3](#133-how-route-based-failover-works) is confirmed against a live `us-gov-east-1` deployment. **The `failoverRoutes` declaration in Step 4 below is not.** It follows CFE's documented schema, but it has not been run end to end in this environment. Validate it in a lab — in both directions — before it appears in a customer design.
+>
+> **IAM is not the blocker — this was checked against the templates.** `failover.yaml` passes `solutionType: failover`, which provisions `BigIpHighAvailabilityAccessRole` (`modules/access/access.yaml`). That role already grants `ec2:ReplaceRoute`, `ec2:CreateRoute`, `ec2:DescribeRouteTables`, and `ec2:DescribeSubnets` alongside the address-failover actions. The other role variants (`standard`, `secret`, `s3`) do **not** carry the route permissions — but this solution does not use them, so do not go looking there.
+>
+> What the route permissions **are** conditioned on is the tag: `ec2:ReplaceRoute` and `ec2:CreateRoute` are allowed only where `aws:ResourceTag/f5_cloud_failover_label` matches `cfeTag`. `ec2:DescribeRouteTables` is ungated. That is why the tagging in Step 3 is not optional — an untagged route table is both invisible to CFE and denied by IAM.
+
+> The template does not yet expose this as a parameter — it is manual post-deploy configuration. **Four things change together**: source/destination checking on the external ENIs, the route table, the CFE declaration, and the AS3 virtual server address. Changing only the CFE declaration is the most common mistake and leaves the VIP unreachable.
+
+**Step 1 — Pick an alien prefix** outside the VPC CIDR, e.g. `10.99.0.0/24`, with the VIP at `10.99.0.100`. Confirm it does not collide with anything reachable from the VPC — including on-prem ranges arriving over Direct Connect or VPN.
+
+**Step 2 — Disable source/destination checking on both external ENIs.** By default AWS drops any packet arriving at an ENI whose destination is not one of that ENI's own addresses. An alien VIP is, by definition, not one of them — so with the check enabled, traffic routed to the ENI is discarded **before the BIG-IP ever sees it**. No log, no counter, no error. The template never disables it, because EIP-based failover never needs to:
+
+```bash
+REGION=us-gov-east-1
+ENI_01=eni-030ec578bd7419ee1        # failover01 external ENI
+ENI_02=eni-0476f6607bec6571d        # failover02 external ENI
+
+for ENI in "$ENI_01" "$ENI_02"; do
+  aws ec2 modify-network-interface-attribute --region "$REGION" \
+    --network-interface-id "$ENI" --no-source-dest-check
+done
+
+# Both must report False
+aws ec2 describe-network-interfaces --region "$REGION" \
+  --network-interface-ids "$ENI_01" "$ENI_02" \
+  --query 'NetworkInterfaces[].[NetworkInterfaceId,SourceDestCheck]' --output text
+```
+
+**Step 3 — Add the route and tag the route tables.** Do this for every route table serving subnets whose clients must reach the VIP. Route the **whole VIP prefix**, not a `/32`: CFE's prefix matching is exact, so the route's destination must be identical to the `scopingAddressRanges` entry in Step 4.
+
+```bash
+REGION=us-gov-east-1
+RTB=rtb-xxxxxxxxxxxx
+ENI_01=eni-030ec578bd7419ee1        # failover01 external ENI
+
+aws ec2 create-route --region "$REGION" \
+  --route-table-id "$RTB" \
+  --destination-cidr-block 10.99.0.0/24 \
+  --network-interface-id "$ENI_01"
+
+# Mandatory twice over: CFE discovers route tables by this tag, and the instance
+# role's ec2:ReplaceRoute is itself conditioned on it matching cfeTag
+aws ec2 create-tags --region "$REGION" --resources "$RTB" \
+  --tags Key=f5_cloud_failover_label,Value=bigip_high_availability_solution
+```
+
+The initial target can be either device; CFE corrects it on the first failover.
+
+**Step 4 — Add `failoverRoutes` to the CFE declaration.** CFE is declarative, so POST the **complete** declaration — the `externalStorage` and `failoverAddresses` blocks must be included or they are removed:
+
+```bash
+curl -sku admin:'PASSWORD' -X POST \
+  https://localhost/mgmt/shared/cloud-failover/declare \
+  -H 'Content-Type: application/json' -d '{
+  "class": "Cloud_Failover",
+  "schemaVersion": "1.0.0",
+  "environment": "aws",
+  "controls": { "class": "Controls", "logLevel": "silly" },
+  "externalStorage": {
+    "encryption": { "serverSide": { "enabled": true, "algorithm": "AES256" } },
+    "scopingName": "<uniqueString>-bigip-high-availability-solution"
+  },
+  "failoverAddresses": {
+    "enabled": true,
+    "scopingTags": { "f5_cloud_failover_label": "bigip_high_availability_solution" },
+    "requireScopingTags": false
+  },
+  "failoverRoutes": {
+    "enabled": true,
+    "routeGroupDefinitions": [
+      {
+        "scopingTags": { "f5_cloud_failover_label": "bigip_high_availability_solution" },
+        "scopingAddressRanges": [ { "range": "10.99.0.0/24" } ],
+        "defaultNextHopAddresses": {
+          "discoveryType": "static",
+          "items": [ "10.0.0.11", "10.0.4.11" ]
+        }
+      }
+    ]
+  }
+}'
+```
+
+`defaultNextHopAddresses.items` are the **external Self IPs** of the two BIG-IPs. CFE resolves each to the ENI that owns it and sets the route target accordingly.
+
+**Step 5 — Rebind the AS3 virtual server** to the new address. The `virtualAddresses` value in the AS3 declaration inside `runtime-init-conf-3nic-payg-instance01/02-with-app.yaml` must become `10.99.0.100` instead of the in-VPC VIP. Re-upload the edited configs to your bucket ([§7](#7-stage-the-templates-and-big-ip-artifacts-in-your-bucket)).
+
+**Step 6 — Make it survive a rebuild.** Steps 4 and 5 are runtime state. To persist them, edit the CFE declaration inside the same runtime-init config files and re-upload — otherwise a redeploy reverts to the shipped `failoverAddresses`-only declaration. Step 2 is an ENI attribute: it survives reboots and failovers, but a redeploy creates new ENIs with the check enabled again, so repeat it after any rebuild.
+
+### 13.5 Verifying
+
+```bash
+# 0. Source/dest check must be False on both external ENIs — if it is True, the VIP is silently unreachable
+aws ec2 describe-network-interfaces --region "$REGION" \
+  --network-interface-ids "$ENI_01" "$ENI_02" \
+  --query 'NetworkInterfaces[].[NetworkInterfaceId,SourceDestCheck]' --output text
+
+# 1. CFE should now report the route it manages — "routes" must NOT be empty
+curl -sku admin:'PASSWORD' https://localhost/mgmt/shared/cloud-failover/inspect \
+  | python3 -m json.tool
+
+# 2. Confirm the current route target
+aws ec2 describe-route-tables --region "$REGION" --route-table-ids "$RTB" \
+  --query 'RouteTables[].Routes[?DestinationCidrBlock==`10.99.0.0/24`]' --output json
+
+# 3. Fail over from the active device
+tmsh run sys failover standby
+
+# 4. Watch the target change to the peer's ENI (allow up to ~60s)
+watch -n2 "aws ec2 describe-route-tables --region $REGION --route-table-ids $RTB \
+  --query 'RouteTables[].Routes[?DestinationCidrBlock==\`10.99.0.0/24\`].NetworkInterfaceId' --output text"
+```
+
+Test in **both** directions — IAM and endpoint problems sometimes surface on only one instance.
+
+### 13.6 Two things to plan for
+
+**Reachability beyond the VPC.** Route-based failover gives you VPC-internal reachability. Clients arriving over Direct Connect, VPN, or a Transit Gateway need the VIP prefix propagated into **those** route tables as well. Straightforward, but it is a conversation with the customer's network team and should be in the design, not discovered during testing.
+
+**Convergence is slower than an EIP move.** Route table updates take longer to take effect than an ENI address reassignment — plan on tens of seconds rather than a handful. **If the customer has a hard RTO, measure it in a lab before it appears in a design document.**
+
+---
+
+## 14. Parameter reference
 
 Defaults below reflect this solution as configured for GovCloud. Anything marked *"leave at default unless you know you need to change it"* is mechanical and rarely touched. Parameters are grouped by the Console parameter sections.
 
@@ -466,8 +669,8 @@ Defaults below reflect this solution as configured for GovCloud. Anything marked
 | --- | --- | --- |
 | `provisionPublicIpMgmt` | Public EIP on management. | `false` to use a bastion only. |
 | `provisionExternalVip` | Whether a floating application VIP exists. | `false` for Self-IPs-only. |
-| `provisionPublicIpVip` | Whether that VIP is public (EIP) or private. | `false` = private VIP (air-gap). |
-| `provisionPublicIpExternalSelf` | EIP on the external Self IPs. | `false` for air-gap (saves 2 EIPs). |
+| `provisionPublicIpVip` | Whether that VIP is public (EIP) or private. | `false` = private VIP (air-gap). ⚠️ Across two AZs this also disables VIP failover unless you configure route-based failover — see [§13](#13-vip-failover-across-availability-zones). |
+| `provisionPublicIpExternalSelf` | EIP on the external Self IPs. | `false` for air-gap (saves 2 EIPs). Ignored when `provisionPublicIpVip=true`, which forces both self EIPs on. |
 | `provisionS3Endpoint` | Provisions S3 gateway + EC2 + Secrets Manager VPC endpoints. | **`true` for air-gap (required).** |
 
 ### Application / telemetry
@@ -482,15 +685,40 @@ Defaults below reflect this solution as configured for GovCloud. Anything marked
 | `bigIpRuntimeInitConfig01` / `02` | URL of each BIG-IP's runtime-init config. **Leave blank** to auto-derive from `s3BucketName`/`s3BucketRegion`/`artifactLocation`. Set only to bring your own BIG-IP config. |
 | `bigIpRuntimeInitPackageUrl` | URL of the runtime-init installer. **Leave blank** to auto-derive. |
 | `bigIpPeerAddr` | Address the second BIG-IP uses to reach the first for clustering (the first instance's management IP). | Leave at default unless you change the IP scheme. |
-| `bigIpMgmtAddress01/02`, `bigIpExternalSelfIp01/02`, `bigIpInternalSelfIp01/02`, `bigIpExternalVip01/02` | Static private IPs for each interface/VIP. | Leave at default unless you change the subnet layout. |
+| `bigIpMgmtAddress01/02`, `bigIpExternalSelfIp01/02`, `bigIpInternalSelfIp01/02`, `bigIpExternalVip01/02` | Static private IPs for each interface/VIP. | Leave at default unless you change the subnet layout. If you change `bigIpExternalVip01/02` you **must** also change `cfeVipTag` — see the callout below. |
 | `bigIpHostname01/02` | Device hostnames (`failover01.local` / `failover02.local`). | Leave at default. |
-| `cfeS3Bucket` | CFE failover-state bucket. **Leave blank** — the stack auto-creates and tags it (`<uniqueString>-bigip-high-availability-solution`). **Do not pre-create it.** |
+| `cfeS3Bucket` | CFE failover-state bucket. **Leave blank** — the stack auto-creates and tags it (`<uniqueString>-bigip-high-availability-solution`). **Do not pre-create it:** setting it to an existing bucket name (including your staging bucket) fails the `bigipinstance1` nested stack with *"Resource of type 'AWS::S3::Bucket' … already exists"*. |
+| `cfeTag` | Value written to the `f5_cloud_failover_label` tag on the NICs, EIPs, and (for route-based failover) route tables that CFE is allowed to manage. Must match the `scopingTags` value in the CFE declaration inside the runtime-init config. |
+| `cfeVipTag` | Comma-separated list of the per-AZ private VIP addresses, written to the application VIP's EIP as the `f5_cloud_failover_vips` tag. Default `10.0.0.101,10.0.4.101`. **Must match `bigIpExternalVip01/02`** — see the callout below. |
 | `uniqueString` | Prefix for named resources (IAM roles, key pair, etc.). | Use a **fresh** value per deployment to avoid IAM name collisions. |
 | `application`, `cost`, `environment`, `group`, `owner` | Resource tags. | Set per your tagging policy. |
 
+> ### ⚠️ `cfeVipTag` must match `bigIpExternalVip01/02`
+> The two BIG-IPs sit in **different Availability Zones**, so their external interfaces are in different subnets and the application VIP is really **two** addresses — `10.0.0.101` on instance 01 and `10.0.4.101` on instance 02. A secondary private IP belongs to its subnet's CIDR and cannot be reassigned to an interface in another subnet, so when the VIP is public CFE fails it over by moving the **EIP association** between those two addresses rather than moving the address itself. It discovers which addresses it may associate to by reading the `f5_cloud_failover_vips` tag on the EIP — and the template populates that tag from `cfeVipTag`.
+>
+> That address list is hardcoded in **three independent places**, and nothing derives one from the others:
+> - `cfeVipTag` — default `10.0.0.101,10.0.4.101`
+> - `bigIpExternalVip01` / `bigIpExternalVip02` — defaults `10.0.0.101` / `10.0.4.101`
+> - the AS3 `virtualAddress` entries in `bigip-configurations/runtime-init-conf-3nic-payg-instance01-with-app.yaml` and `…instance02-with-app.yaml`
+>
+> So if you change your subnet layout, update `bigIpExternalVip01/02` as the row above invites you to, and leave `cfeVipTag` at its default, the EIP ends up tagged with addresses that exist on neither device. CFE has nothing to match, **the EIP never moves, and nothing reports an error.** The stack still reaches CREATE_COMPLETE, clustering still goes green, and `cloud-failover/inspect` still returns cleanly — you find out at the first real failover. Change all three together, or leave all three alone.
+>
+> This applies only when `provisionPublicIpVip=true`. With the air-gap profile (`provisionPublicIpVip=false`) no VIP EIP is created and the tag is unused — see [§13](#13-vip-failover-across-availability-zones) for what fails over instead.
+
+After the stack completes, confirm the tag matches the addresses actually configured on the devices:
+
+```bash
+aws ec2 describe-addresses --region "$REGION" \
+  --filters "Name=tag:f5_cloud_failover_label,Values=bigip_high_availability_solution" \
+  --query 'Addresses[].[PublicIp,Tags[?Key==`f5_cloud_failover_vips`].Value|[0]]' \
+  --output table
+```
+
+The addresses it prints must be exactly your `bigIpExternalVip01` and `bigIpExternalVip02` values.
+
 ---
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 ### Deployment fails at `AmiInfo`
 The `bigIpImage` pattern matched no marketplace image in your Region/partition. List what's available (`aws ec2 describe-images … "Name=name,Values=*17.5*PAYG-Best Plus 25Mbps*"`) and set `bigIpImage` to a build that exists. (Historic note: an earlier failure here was caused by the AMI-lookup Lambda depending on a private F5 Lambda layer; that is already fixed in this repo's `modules/function/function.yaml`.)
@@ -507,6 +735,39 @@ The bucket artifacts aren't anonymously readable. Re-check [Step 8](#8-make-the-
 
 ### AS3 `ECONNREFUSED` / CFE `Failover initialization failed: undefined`
 The dataplane has no path to AWS service endpoints (you turned off the external Self-IP EIPs). Set **`provisionS3Endpoint=true`** and redeploy — it provisions the S3 + EC2 + Secrets Manager endpoints CFE and AS3 need ([Step 9](#9-air-gap-choose-your-public-ip-toggles-and-endpoints)). (CFE on GovCloud also requires the `scopingName` storage discovery rather than tag-based discovery; this is already wired into the runtime-init configs via the `cfeStorageName` instance tag.)
+
+### Stack deploys and clusters, but the VIP never fails over
+**Symptom:** everything reaches CREATE_COMPLETE, `tmsh show cm sync-status` is green, `cloud-failover/inspect` returns cleanly — but a failover moves nothing and the VIP is unreachable from the standby side. `inspect` shows `"routes": []`, and the VIP addresses on the two devices are in **different subnets** (e.g. `10.0.0.101` and `10.0.4.101`).
+
+**Cause:** the BIG-IPs are in different AZs, so the private VIP cannot be reassigned across subnets, and `provisionPublicIpVip=false` means there is no EIP for `failoverAddresses` to move instead. Nothing is configured that CFE is able to relocate. `restnoded.log` shows no error, because from CFE's point of view there is nothing to do.
+
+**Fix:** either set `provisionPublicIpVip=true` (needs one EIP and internet egress), or configure **route-based failover** with a VIP outside the VPC CIDR — see [§13](#13-vip-failover-across-availability-zones). Route-based is the air-gap answer and requires no public addressing.
+
+**Diagnostic sequence:**
+
+```bash
+curl -sku admin:'PW' https://localhost/mgmt/shared/cloud-failover/declare | python3 -m json.tool
+curl -sku admin:'PW' https://localhost/mgmt/shared/cloud-failover/inspect  | python3 -m json.tool
+aws ec2 describe-network-interfaces --region "$REGION" \
+  --filters "Name=tag:f5_cloud_failover_label,Values=bigip_high_availability_solution" \
+  --query 'NetworkInterfaces[].[NetworkInterfaceId,AvailabilityZone,SubnetId,PrivateIpAddresses[].PrivateIpAddress]' \
+  --output json
+```
+
+No `failoverRoutes` in the declaration, empty `routes` in inspect, and external ENIs in different subnets is the signature of this condition.
+
+### Route-based failover: the route moves, but the VIP does not answer
+**Symptom:** after `tmsh run sys failover standby`, `describe-route-tables` shows the VIP route's target flip to the peer's ENI and `cloud-failover/inspect` lists the route — yet clients get no response from the VIP on either device, and the virtual server's counters stay at zero.
+
+**Cause:** source/destination checking is still enabled on the external ENIs. AWS discards any packet whose destination is not one of the ENI's own addresses before it reaches the instance — no log, no counter. An alien-IP VIP is never one of the ENI's own addresses.
+
+**Fix:** disable the check on **both** external ENIs ([§13.4 Step 2](#134-configuring-it)), and re-check it after any redeploy — new ENIs are created with it enabled:
+
+```bash
+aws ec2 describe-network-interfaces --region "$REGION" \
+  --network-interface-ids "$ENI_01" "$ENI_02" \
+  --query 'NetworkInterfaces[].[NetworkInterfaceId,SourceDestCheck]' --output text
+```
 
 ### Clustering does not form / "no trust domain"
 **Symptom:** all stacks deploy (or the BIG-IP stack times out) but the pair never clusters. `tmsh show cm sync-status` → `Status: Unknown`, `Summary: no trust domain`, `Mode: standalone`; `tmsh list cm trust-domain` is empty. In `/var/log/restnoded/restnoded.log`:
@@ -563,7 +824,7 @@ If trust never forms and `curl -sku admin:'PW' https://<peer-mgmt>/mgmt/tm/sys/v
 
 ---
 
-## 15. Tear down
+## 16. Tear down
 
 ```bash
 aws cloudformation delete-stack --region "$REGION" --stack-name myFailover
