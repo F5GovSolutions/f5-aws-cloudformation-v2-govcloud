@@ -44,6 +44,12 @@ make is served by a VPC endpoint.
 | Management access | Public EIP (eval) or bastion | **Session Manager** through a private jump host (`provisionSsmAccess`, default); public bastion only as a fallback (`provisionBastion`) |
 | Public-IP toggles | 4 parameters | Removed - fixed to none |
 
+**Demo responder.** With `provisionExampleApp=false` (the default) the VIP's pool has no
+members, and an iRule in the AS3 declaration answers HTTP and HTTPS requests itself with
+a page naming the BIG-IP that served it and the VIP it arrived on, refreshing every two
+seconds. Open it in a browser, trigger a failover, and watch the device name change. With
+a real back end deployed the rule steps aside and traffic is load balanced normally.
+
 Why the EIP-based template cannot do this: a secondary private IP belongs to its subnet's
 CIDR and cannot be reassigned to an ENI in another subnet. Across two AZs the only thing
 `failoverAddresses` can move is an EIP association, so with no EIP there is nothing to

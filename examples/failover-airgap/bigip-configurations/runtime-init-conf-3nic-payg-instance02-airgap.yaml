@@ -1,7 +1,8 @@
 # Air-gap (route-based VIP failover) variant of
 # examples/failover/bigip-configurations/runtime-init-conf-3nic-payg-instance02-with-app.yaml
 # Differences: CFE failoverRoutes block; AS3 virtual server on the alien VIP
-# (externalVipAddress instance tag); three extra tag-sourced runtime_parameters.
+# (externalVipAddress instance tag); a demo responder iRule; three extra tag-sourced
+# runtime_parameters.
 # Keep everything else in sync with the source file - see ../MAINTAINING.md.
 controls:
   logLevel: info
@@ -180,6 +181,22 @@ extension_services:
               url: https://f5-cft-gov.s3.us-gov-east-1.amazonaws.com/f5-aws-cloudformation-v2/v3.6.0.0/examples/autoscale/bigip-configurations/Rapid_Deployment_Policy_13_1.xml
               enforcementMode: blocking
               ignoreChanges: false
+            Demo_Responder:
+              # Answers HTTP requests itself when the pool has no active members, which is
+              # the case with provisionExampleApp=false. The page names the device that
+              # served it and the VIP it arrived on, and refreshes every 2 seconds, so a
+              # failover is visible in a browser. With a real back end (pool members
+              # discovered) the rule does nothing and traffic is load balanced normally.
+              class: iRule
+              iRule: |
+                when HTTP_REQUEST {
+                    if { [active_members /Tenant_1/Shared/Service_01_Pool] > 0 } { return }
+                    set host [info hostname]
+                    set vip [IP::local_addr]
+                    set client [IP::client_addr]
+                    set now [clock format [clock seconds] -format "%Y-%m-%d %H:%M:%S %Z"]
+                    HTTP::respond 200 content "<!DOCTYPE html><html><head><meta http-equiv=\"refresh\" content=\"2\"><title>F5 HA demo</title></head><body style=\"font-family:sans-serif;text-align:center;padding-top:100px\"><h1 style=\"font-size:56px;margin:0\">Served by</h1><h1 style=\"font-size:88px;color:#E4002B;margin:0\">$host</h1><p style=\"font-size:24px;color:#666\">VIP $vip &middot; client $client<br>$now</p></body></html>" noserver "Content-Type" "text/html" "Cache-Control" "no-store"
+                }
             Service_Address_01:
               class: Service_Address
               virtualAddress: "{{{EXTERNAL_VIP_ADDRESS}}}"
@@ -192,6 +209,8 @@ extension_services:
                 - use: "/Tenant_1/Shared/Service_Address_01"
               snat: auto
               pool: "/Tenant_1/Shared/Service_01_Pool"
+              iRules:
+                - use: "/Tenant_1/Shared/Demo_Responder"
               profileHTTP:
                 use: "/Tenant_1/Shared/Custom_HTTP_Profile"
               policyWAF:
@@ -208,6 +227,8 @@ extension_services:
               serverTLS:
                 bigip: "/Common/clientssl"
               redirect80: false
+              iRules:
+                - use: "/Tenant_1/Shared/Demo_Responder"
               profileHTTP:
                 use: "/Tenant_1/Shared/Custom_HTTP_Profile"
               policyWAF:

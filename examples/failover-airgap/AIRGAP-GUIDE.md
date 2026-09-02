@@ -134,6 +134,11 @@ aws ssm start-session --region "$REGION" --target "$JUMP"
 Each `start-session` holds the terminal; run them in separate windows. Use `8444` /
 `2223` for BIG-IP B, or just paste the `ssmPortForwardBigIp02` output.
 
+**The GUI works through the tunnel.** With the first command running, browse
+`https://localhost:8443`, accept the BIG-IP's self-signed certificate warning, and log in
+as `admin` with the password from `bigIpSecretArn`. REST calls work the same way
+(`curl -sku admin:"$PW" https://localhost:8443/mgmt/shared/cloud-failover/inspect`).
+
 > **Session logging.** Session Manager can write every session's keystrokes to CloudWatch
 > Logs or S3, which is materially better evidence for an ATO package than a bastion's
 > syslog. It is an account-level Session Manager preference, not a stack resource, so this
@@ -174,12 +179,36 @@ watch -n2 "aws ec2 describe-route-tables --region $REGION --route-table-ids $RTB
 
 # 6. From a client in the VPC, the VIP must answer before and after. A Session Manager shell
 #    on the jump host is the easiest client: aws ssm start-session --target "$JUMP"
-curl -sk https://10.99.0.100/
+#    With no back-end app deployed, the demo responder answers and names the device:
+curl -sk https://10.99.0.100/ | grep -o 'failover0[12][.a-z]*'     # flips after step 5
 ```
 
 Then fail back and repeat. IAM and endpoint problems sometimes surface on only one
 instance. Record the time between step 5 and the route showing the new target; that is the
 number a customer with an RTO needs.
+
+### 5a. Showing it in a browser
+
+Every AS3 declaration in this directory carries a `Demo_Responder` iRule. When the VIP's
+pool has no active members - which is the case with `provisionExampleApp=false` - it
+answers HTTP and HTTPS requests itself with a page that names the BIG-IP that served it,
+the VIP address, the client address and the time, and refreshes itself every two seconds.
+When the example app (or any real pool member) is present the rule returns immediately and
+traffic is load balanced as normal, so it never has to be removed.
+
+For a demo, forward a local port to the VIP through the jump host and leave the page open
+while you fail over:
+
+```bash
+aws ssm start-session --region "$REGION" --target "$JUMP" \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["10.99.0.100"],"portNumber":["443"],"localPortNumber":["9443"]}'
+# browse https://localhost:9443 - "Served by failover02.local" becomes failover01.local
+# a few seconds after "tmsh run sys failover standby" on the active device
+```
+
+The page turning over is the whole failover mechanism in one screen: the route moved,
+the peer became active, and the client never changed the address it was talking to.
 
 ## 6. Two things to plan for
 

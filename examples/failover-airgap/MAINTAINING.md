@@ -59,6 +59,9 @@ Each config is the corresponding `-with-app.yaml` file plus:
    instead of four.
 3. Three tag-sourced `runtime_parameters`: `EXTERNAL_VIP_ADDRESS`, `EXTERNAL_VIP_CIDR`,
    `PEER_SELF_IP_EXTERNAL`.
+4. A `Demo_Responder` iRule in `Shared`, attached to both services. It only acts when the
+   pool has no active members. Nothing about it is air-gap specific; `examples/failover`
+   could adopt it, in which case keep the two copies identical.
 
 **Everything else must be mirrored** when the source files change: extension versions and
 hashes, the DO declaration, the WAF policy URL, and the base64 `cluster-heal.sh` blob in
