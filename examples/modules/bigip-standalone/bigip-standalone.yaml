@@ -149,6 +149,12 @@ Conditions:
     - !Equals
       - !Ref 'cfeTag'
       - ''
+  sourceDestCheckDisabled: !Equals
+    - !Ref 'disableSourceDestCheck'
+    - 'true'
+  hasExternalInterface: !Or
+    - !Condition 'is2Nic'
+    - !Condition 'is3Nic'
   useStaticExternalIpAddr: !And
     - !Not
       - !Equals
@@ -383,6 +389,14 @@ Outputs:
       - !GetAtt
         - BigipStaticInternalInterface
         - PrimaryPrivateIpAddress
+  bigIpExternalInterfaceId:
+    Condition: hasExternalInterface
+    Description: Network interface ID of BIG-IP instance NIC eth1 (external). Used as the
+      initial target of route-based failover routes.
+    Value: !If
+      - useDynamicExternalIpAddr
+      - !Ref 'BigipExternalInterface'
+      - !Ref 'BigipStaticExternalInterface'
 Parameters:
   allowUsageAnalytics:
     AllowedValues:
@@ -429,9 +443,27 @@ Parameters:
     Description: Cloud Failover deployment tag value.
     Type: String
     Default: ''
+  bigIpPeerExternalSelfIp:
+    Default: ''
+    Description: External Self IP address of the peer BIG-IP. Exposed to runtime-init as
+      the peerExternalSelfIp instance tag, for the static next-hop list of a Cloud
+      Failover Extension failoverRoutes declaration (route-based VIP failover). Leave
+      empty when not using route-based failover.
+    Type: String
   cost:
     Default: f5cost
     Description: Cost Center Tag.
+    Type: String
+  disableSourceDestCheck:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+    Description: Set to true to disable source/destination checking on the external
+      network interface. Required for route-based VIP failover, where the VIP is an
+      address outside the VPC CIDR routed to this interface - with the check enabled AWS
+      drops traffic whose destination is not one of the interface's own addresses. Leave
+      false for EIP-based (failoverAddresses) deployments.
     Type: String
   environment:
     Default: f5env
@@ -469,6 +501,18 @@ Parameters:
       the external (2/3 NIC) or management (1 NIC) network interface as secondary
       private addresses (for virtual services).
     Type: CommaDelimitedList
+  externalVipAddress:
+    Default: ''
+    Description: Virtual server address outside the VPC CIDR used for route-based VIP
+      failover. Exposed to runtime-init as the externalVipAddress instance tag. Leave
+      empty when not using route-based failover.
+    Type: String
+  externalVipCidr:
+    Default: ''
+    Description: Prefix, outside the VPC CIDR and containing externalVipAddress, that is
+      routed to the active BIG-IP for route-based VIP failover. Exposed to runtime-init
+      as the externalVipCidr instance tag. Leave empty when not using route-based failover.
+    Type: String
   externalSubnetId:
     Default: ''
     Description: 'The resource ID of the external subnet. ***Note:*** Subnet ID parameters
@@ -687,6 +731,10 @@ Resources:
     Condition: useDynamicExternalIpAddr
     Properties:
       Description: Public External Interface for the BIG-IP
+      SourceDestCheck: !If
+        - sourceDestCheckDisabled
+        - false
+        - !Ref 'AWS::NoValue'
       SecondaryPrivateIpAddressCount: !Ref 'numSecondaryPrivateIpAddresses'
       GroupSet:
         - !Ref 'externalSecurityGroupId'
@@ -834,6 +882,10 @@ Resources:
     Condition: useStaticExternalIpAddr
     Properties:
       Description: Public External Interface for the BIG-IP
+      SourceDestCheck: !If
+        - sourceDestCheckDisabled
+        - false
+        - !Ref 'AWS::NoValue'
       GroupSet:
         - !Ref 'externalSecurityGroupId'
       PrivateIpAddress: !If
@@ -1167,6 +1219,12 @@ Resources:
           Value: !Sub '${cfeS3Bucket}.s3.${AWS::Region}.amazonaws.com'
         - Key: hostname
           Value: !Ref 'hostname'
+        - Key: externalVipAddress
+          Value: !Ref 'externalVipAddress'
+        - Key: externalVipCidr
+          Value: !Ref 'externalVipCidr'
+        - Key: peerExternalSelfIp
+          Value: !Ref 'bigIpPeerExternalSelfIp'
         - Key: vip1Addr
           Value: !If
             - hasOneExternalServiceIPs
@@ -1427,6 +1485,12 @@ Resources:
           Value: !Sub '${cfeS3Bucket}.s3.${AWS::Region}.amazonaws.com'
         - Key: hostname
           Value: !Ref 'hostname'
+        - Key: externalVipAddress
+          Value: !Ref 'externalVipAddress'
+        - Key: externalVipCidr
+          Value: !Ref 'externalVipCidr'
+        - Key: peerExternalSelfIp
+          Value: !Ref 'bigIpPeerExternalSelfIp'
         - Key: vip1Addr
           Value: !If
             - hasOneExternalServiceIPs
@@ -1681,6 +1745,12 @@ Resources:
           Value: !Sub '${cfeS3Bucket}.s3.${AWS::Region}.amazonaws.com'
         - Key: hostname
           Value: !Ref 'hostname'
+        - Key: externalVipAddress
+          Value: !Ref 'externalVipAddress'
+        - Key: externalVipCidr
+          Value: !Ref 'externalVipCidr'
+        - Key: peerExternalSelfIp
+          Value: !Ref 'bigIpPeerExternalSelfIp'
         - Key: vip1Addr
           Value: !If
             - hasOneExternalServiceIPs

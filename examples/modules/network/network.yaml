@@ -11,6 +11,10 @@ Conditions:
   deployS3Endpoint: !Equals
     - !Ref 'provisionS3Endpoint'
     - 'true'
+  tagRouteTablesForFailover: !Not
+    - !Equals
+      - !Ref 'routeTableFailoverTag'
+      - ''
   az2: !Or
     - !Equals
       - !Ref numAzs
@@ -486,6 +490,14 @@ Parameters:
       - 'false'
     Default: 'false'
     Description: Value of true provisions the VPC endpoints required for air-gapped / no-egress deployments - an S3 Gateway endpoint (Cloud Failover state storage, runtime-init artifacts) plus EC2, Secrets Manager, and CloudFormation Interface endpoints (Cloud Failover Extension API calls, secret retrieval, and the BIG-IP cfn-signal stack-success signal). Required when the BIG-IP dataplane has no internet egress (e.g. provisionPublicIpExternalSelf=false), or CFE initialization and the CloudFormation success signal will fail.
+    Type: String
+  routeTableFailoverTag:
+    Default: ''
+    Description: When set, every route table created by this template is tagged
+      f5_cloud_failover_label=<value>. F5 Cloud Failover Extension discovers route tables
+      by that tag for route-based failover (failoverRoutes), and the BIG-IP instance
+      role's ec2:ReplaceRoute / ec2:CreateRoute permissions are conditioned on it. Leave
+      empty to create untagged route tables (EIP-based failover does not need it).
     Type: String
   setPublicSubnet1:
     AllowedValues:
@@ -3188,6 +3200,11 @@ Resources:
               - '-public-rt'
         - Key: Network
           Value: Public
+        - Fn::If:
+            - tagRouteTablesForFailover
+            - Key: f5_cloud_failover_label
+              Value: !Ref 'routeTableFailoverTag'
+            - !Ref 'AWS::NoValue'
         - Key: application
           Value: !Ref application
         - Key: costcenter
@@ -3241,6 +3258,11 @@ Resources:
               - '-private-rt-A'
         - Key: Network
           Value: Private
+        - Fn::If:
+            - tagRouteTablesForFailover
+            - Key: f5_cloud_failover_label
+              Value: !Ref 'routeTableFailoverTag'
+            - !Ref 'AWS::NoValue'
         - Key: application
           Value: !Ref application
         - Key: costcenter
@@ -3376,6 +3398,11 @@ Resources:
               - '-private-rt-B'
         - Key: Network
           Value: Private
+        - Fn::If:
+            - tagRouteTablesForFailover
+            - Key: f5_cloud_failover_label
+              Value: !Ref 'routeTableFailoverTag'
+            - !Ref 'AWS::NoValue'
         - Key: application
           Value: !Ref application
         - Key: costcenter
@@ -3511,6 +3538,11 @@ Resources:
               - '-private-rt-C'
         - Key: Network
           Value: Private
+        - Fn::If:
+            - tagRouteTablesForFailover
+            - Key: f5_cloud_failover_label
+              Value: !Ref 'routeTableFailoverTag'
+            - !Ref 'AWS::NoValue'
         - Key: application
           Value: !Ref application
         - Key: costcenter
@@ -3646,6 +3678,11 @@ Resources:
               - '-private-rt-D'
         - Key: Network
           Value: Private
+        - Fn::If:
+            - tagRouteTablesForFailover
+            - Key: f5_cloud_failover_label
+              Value: !Ref 'routeTableFailoverTag'
+            - !Ref 'AWS::NoValue'
         - Key: application
           Value: !Ref application
         - Key: costcenter
