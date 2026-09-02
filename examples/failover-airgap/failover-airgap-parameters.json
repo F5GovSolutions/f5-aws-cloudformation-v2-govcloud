@@ -137,11 +137,15 @@
   },
   {
     "ParameterKey": "provisionBastion",
-    "ParameterValue": "true"
+    "ParameterValue": "false"
   },
   {
     "ParameterKey": "provisionExampleApp",
     "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "provisionSsmAccess",
+    "ParameterValue": "true"
   },
   {
     "ParameterKey": "restrictedSrcAddressApp",

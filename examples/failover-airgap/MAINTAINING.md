@@ -9,11 +9,12 @@ duplication, and this file is what keeps the two from drifting.
 
 | Component | Status | Notes |
 |---|---|---|
-| `modules/network/network.yaml` | **Shared** | Gains one optional parameter, `routeTableFailoverTag` (default `''`). With the default the module behaves exactly as before. This template passes `cfeTag`, which tags every route table `f5_cloud_failover_label=<cfeTag>`. |
+| `modules/network/network.yaml` | **Shared** | Gains two optional parameters, both default-off: `routeTableFailoverTag` (tags every route table `f5_cloud_failover_label=<value>`; this template passes `cfeTag`) and `provisionSsmEndpoints` (adds the `ssm`, `ssmmessages`, `ec2messages` interface endpoints). The endpoint security group's condition widened to "S3 endpoints **or** SSM endpoints". With the defaults the module behaves exactly as before. |
 | `modules/access/access.yaml` | **Shared, unchanged** | `solutionType: failover` selects `BigIpHighAvailabilityAccessRole`, which already grants `ec2:ReplaceRoute`, `ec2:CreateRoute` and `ec2:DescribeRouteTables`. The write actions are conditioned on the route table carrying `f5_cloud_failover_label` = `cfeTag`, which is why the network tag above is mandatory. |
 | `modules/dag/dag.yaml` | **Shared, unchanged** | Called with `numberPublicExternalIpAddresses=0` and `numberPublicMgmtIpAddresses=0`, which creates no EIP resources at all. |
 | `modules/bigip-standalone/bigip-standalone.yaml` | **Shared** | Gains four optional parameters (`disableSourceDestCheck`, `externalVipAddress`, `externalVipCidr`, `bigIpPeerExternalSelfIp`), three instance tags carrying the last three to runtime-init, and one output (`bigIpExternalInterfaceId`). All default to the previous behaviour. |
-| `modules/bastion/bastion.yaml` | **Shared, unchanged** | Optional here (`provisionBastion`). |
+| `modules/bastion/bastion.yaml` | **Shared, unchanged** | Fallback only (`provisionBastion`, default `false`). |
+| `modules/ssm-jump/ssm-jump.yaml` | **New** | Private Session Manager jump host: IAM role with `AmazonSSMManagedInstanceCore`, egress-only security group, IMDSv2-only launch template, Amazon Linux 2023 via the SSM public AMI parameter. Only this solution uses it so far; nothing about it is air-gap specific, so `examples/failover` could adopt it later. |
 | `modules/function`, `modules/application` | **Shared, unchanged** | |
 | `failover-airgap.yaml` | **Forked** from `failover/failover.yaml` | See "Parent template differences" below. |
 | `bigip-configurations/runtime-init-conf-3nic-payg-instance0{1,2}-airgap.yaml` | **Forked** from `failover/bigip-configurations/runtime-init-conf-3nic-payg-instance0{1,2}-with-app.yaml` | See "Runtime-init differences" below. |
@@ -33,17 +34,18 @@ diff examples/failover/failover.yaml examples/failover-airgap/failover-airgap.ya
   `provisionPublicIpExternalSelf`, `provisionExternalVip`, `provisionS3Endpoint`,
   `bigIpExternalVip01`, `bigIpExternalVip02`, `cfeVipTag`. Their values are fixed: no
   public IPs anywhere, no secondary private IPs, VPC endpoints always on.
-- **Added parameters:** `externalVipAddress`, `externalVipCidr`, `provisionBastion`.
+- **Added parameters:** `externalVipAddress`, `externalVipCidr`, `provisionSsmAccess`, `provisionBastion` (default `false` here).
 - **Instances:** `disableSourceDestCheck='true'`, the three VIP/peer parameters, all EIP
   allocation IDs `''`, `numExternalPublicIpAddresses=0`, `numSecondaryPrivateIpAddresses=0`,
   default runtime-init config URLs point at this directory.
 - **DAG:** both public-address counts `0`, `cfeVipTag=''`.
 - **Network:** `setPublicSubnet1='false'`, `provisionS3Endpoint='true'`,
-  `routeTableFailoverTag=cfeTag`.
-- **New resources:** `VipRoutePublic`, `VipRoutePrivateA`, `VipRoutePrivateB` -
-  `AWS::EC2::Route` entries for `externalVipCidr` targeting instance A's external ENI.
+  `provisionSsmEndpoints` from `provisionSsmAccess`, `routeTableFailoverTag=cfeTag`.
+- **New resources:** `SsmJump` nested stack; `VipRoutePublic`, `VipRoutePrivateA`,
+  `VipRoutePrivateB` - `AWS::EC2::Route` entries for `externalVipCidr` targeting instance
+  A's external ENI.
 - **Outputs:** public-IP outputs removed; `vipAddress`, `vipRouteCidr`, `vipRouteTableIds`,
-  `bigIpExternalInterfaceId01/02` added.
+  `bigIpExternalInterfaceId01/02`, `ssmJumpInstanceId`, `ssmPortForwardBigIp01/02` added.
 
 ## Runtime-init differences
 

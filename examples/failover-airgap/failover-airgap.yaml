@@ -41,6 +41,7 @@ Metadata:
       - Label:
           default: Management access / Ingress
         Parameters:
+          - provisionSsmAccess
           - provisionBastion
           - restrictedSrcAddressMgmt
           - restrictedSrcAddressApp
@@ -146,7 +147,9 @@ Metadata:
       owner:
         default: Owner
       provisionBastion:
-        default: Provision a bastion host for management access
+        default: Provision a public bastion host (fallback when Session Manager is not available)
+      provisionSsmAccess:
+        default: Provision Session Manager access (private jump host + SSM endpoints)
       provisionExampleApp:
         default: Provision Example App
       restrictedSrcAddressApp:
@@ -216,6 +219,31 @@ Outputs:
         - - !Ref 'uniqueString'
           - '-bigip-high-availability-solution'
       - !Ref 'cfeS3Bucket'
+  ssmJumpInstanceId:
+    Condition: deploySsm
+    Description: SSM-managed private jump host. "aws ssm start-session --target <id>" opens a
+      shell on it; the ssmPortForward* outputs reach the BIG-IP management interfaces
+    Value: !GetAtt [SsmJump, Outputs.ssmJumpInstanceId]
+  ssmPortForwardBigIp01:
+    Condition: deploySsm
+    Description: Forwards localhost:8443 to BIG-IP instance A management (GUI at https://localhost:8443)
+    Value: !Sub
+      - >-
+        aws ssm start-session --region ${AWS::Region} --target ${JUMP}
+        --document-name AWS-StartPortForwardingSessionToRemoteHost
+        --parameters '{"host":["${MGMT}"],"portNumber":["443"],"localPortNumber":["8443"]}'
+      - JUMP: !GetAtt [SsmJump, Outputs.ssmJumpInstanceId]
+        MGMT: !GetAtt [BigIpInstance01, Outputs.bigIpManagementInterfacePrivateIp]
+  ssmPortForwardBigIp02:
+    Condition: deploySsm
+    Description: Forwards localhost:8444 to BIG-IP instance B management (GUI at https://localhost:8444)
+    Value: !Sub
+      - >-
+        aws ssm start-session --region ${AWS::Region} --target ${JUMP}
+        --document-name AWS-StartPortForwardingSessionToRemoteHost
+        --parameters '{"host":["${MGMT}"],"portNumber":["443"],"localPortNumber":["8444"]}'
+      - JUMP: !GetAtt [SsmJump, Outputs.ssmJumpInstanceId]
+        MGMT: !GetAtt [BigIpInstance02, Outputs.bigIpManagementInterfacePrivateIp]
   vipAddress:
     Description: Application VIP. Reachable from inside the VPC, and from any network that
       routes vipRouteCidr into it. Never a public address.
@@ -440,11 +468,23 @@ Parameters:
     AllowedValues:
       - 'true'
       - 'false'
+    Default: 'false'
+    Description: Fallback for environments where Systems Manager is not available. Deploys
+      the Linux bastion host (modules/bastion) in the first external subnet with a public
+      IP address and SSH open to restrictedSrcAddressMgmt. This puts a public address and an
+      open port into the air gap; prefer provisionSsmAccess.
+    Type: String
+  provisionSsmAccess:
+    AllowedValues:
+      - 'true'
+      - 'false'
     Default: 'true'
-    Description: Deploys the Linux bastion host (modules/bastion) in the first external
-      subnet with a public IP address, because the BIG-IP management interfaces have no
-      public addresses in this solution. Set to false when management is reached over
-      private connectivity (Direct Connect, VPN, Transit Gateway) or AWS Systems Manager.
+    Description: Deploys a private jump host managed by AWS Systems Manager Session Manager
+      (modules/ssm-jump) in the BIG-IP management subnet, plus the ssm, ssmmessages and
+      ec2messages VPC endpoints it needs. The host has no public IP, no inbound rules and
+      no SSH key; operators reach the BIG-IP management interfaces by port-forwarding
+      through it with "aws ssm start-session". Set to false only if management is reached
+      over private connectivity (Direct Connect, VPN, Transit Gateway).
     Type: String
   provisionExampleApp:
     AllowedValues:
@@ -547,6 +587,9 @@ Conditions:
   deployBastion: !Equals
     - 'true'
     - !Ref 'provisionBastion'
+  deploySsm: !Equals
+    - 'true'
+    - !Ref 'provisionSsmAccess'
   twoAzs: !Not
     - !Condition sameAz
   deployExampleApp: !Equals
@@ -921,11 +964,41 @@ Resources:
         numSubnets: !Ref 'numSubnets'
         setPublicSubnet1: 'false'
         provisionS3Endpoint: 'true'
+        provisionSsmEndpoints: !If [deploySsm, 'true', 'false']
         routeTableFailoverTag: !Ref 'cfeTag'
         subnetMask: !Ref 'subnetMask'
         uniqueString: !Ref 'uniqueString'
         vpcCidr: !Ref 'vpcCidr'
         vpcTenancy: default
+        application: !Ref 'application'
+        cost: !Ref 'cost'
+        environment: !Ref 'environment'
+        group: !Ref 'group'
+        owner: !Ref 'owner'
+  SsmJump:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: deploySsm
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/ssm-jump/ssm-jump.yaml'
+        - S3Region: !Ref 's3BucketRegion'
+          S3Bucket: !Ref 's3BucketName'
+      Parameters:
+        subnetId: !Join
+          - ','
+          - - !Select
+              - '1'
+              - !Split
+                - ','
+                - !GetAtt
+                  - Network
+                  - Outputs.subnetsA
+        uniqueString: !Ref 'uniqueString'
+        vipCidr: !Ref 'externalVipCidr'
+        vpc: !GetAtt
+          - Network
+          - Outputs.vpcId
+        vpcCidr: !Ref 'vpcCidr'
         application: !Ref 'application'
         cost: !Ref 'cost'
         environment: !Ref 'environment'

@@ -40,8 +40,8 @@ make is served by a VPC endpoint.
 | What CFE moves on failover | The EIP association (`failoverAddresses`) | **The target ENI of the VIP route** in every route table (`failoverRoutes`) |
 | Source/dest check on external ENIs | Enabled (AWS default) | **Disabled** (required for an alien-IP VIP) |
 | Route tables | Untagged | Tagged `f5_cloud_failover_label=cfeTag`, one VIP route each |
-| VPC endpoints | Optional (`provisionS3Endpoint`) | **Always** |
-| Management access | Public EIP (eval) or bastion | Bastion (optional, `provisionBastion`) or private connectivity |
+| VPC endpoints | Optional (`provisionS3Endpoint`) | **Always** (S3, EC2, Secrets Manager, CloudFormation), plus SSM, SSM Messages and EC2 Messages when `provisionSsmAccess=true` |
+| Management access | Public EIP (eval) or bastion | **Session Manager** through a private jump host (`provisionSsmAccess`, default); public bastion only as a fallback (`provisionBastion`) |
 | Public-IP toggles | 4 parameters | Removed - fixed to none |
 
 Why the EIP-based template cannot do this: a secondary private IP belongs to its subnet's
@@ -65,6 +65,11 @@ In addition:
 - **Off-VPC clients need the prefix propagated.** The template routes the VIP prefix inside
   the VPC only. Clients on other networks need `externalVipCidr` routed into this VPC in
   *their* route tables (Transit Gateway route, VPN static route, and so on).
+- **For Session Manager access**, the operator's workstation needs the AWS CLI with the
+  [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+  installed, and an IAM identity allowed `ssm:StartSession` on the jump instance and on
+  the `AWS-StartPortForwardingSessionToRemoteHost` document. No key pair, no public IP
+  and no inbound security group rule are involved.
 
 ## Template Input Parameters
 
@@ -77,7 +82,8 @@ The parameters are those of `failover.yaml` **minus** the public-IP toggles
 |---|---|---|---|
 | `externalVipAddress` | No | `10.99.0.100` | The application VIP. Must be outside the VPC CIDR and inside `externalVipCidr`. Bound to the AS3 virtual servers on both devices. |
 | `externalVipCidr` | No | `10.99.0.0/24` | Prefix routed to the active BIG-IP. One `AWS::EC2::Route` for exactly this prefix is created per route table, and the CFE declaration manages routes for exactly this prefix. |
-| `provisionBastion` | No | `true` | Deploy the Linux bastion (`modules/bastion`) in the first external subnet with a public IP. Set `false` when management is reached over private connectivity or Systems Manager. |
+| `provisionSsmAccess` | No | `true` | Deploy a private jump host managed by Systems Manager Session Manager (`modules/ssm-jump`) in the BIG-IP management subnet, plus the SSM interface endpoints. No public IP, no inbound rules, no SSH key. |
+| `provisionBastion` | No | `false` | Fallback only: deploy the Linux bastion (`modules/bastion`) in the first external subnet **with a public IP** and SSH open to `restrictedSrcAddressMgmt`. |
 
 See `failover-airgap-parameters.json` for a complete example parameter set.
 
@@ -89,8 +95,10 @@ See `failover-airgap-parameters.json` for a complete example parameter set.
 | `vipRouteCidr` | The prefix CFE manages. |
 | `vipRouteTableIds` | The route tables carrying the VIP route. |
 | `bigIpExternalInterfaceId01` / `02` | External ENIs; `01` is the initial route target. |
-| `bigIpInstanceMgmtPrivateIp01` / `02` | Management addresses (reach them via the bastion). |
-| `bastionPublicIp`, `bastionHostInstanceId` | When `provisionBastion=true`. |
+| `bigIpInstanceMgmtPrivateIp01` / `02` | Management addresses (reach them through the jump host). |
+| `ssmJumpInstanceId` | The Session Manager target. |
+| `ssmPortForwardBigIp01` / `02` | Ready-to-paste `aws ssm start-session` commands that forward `localhost:8443` / `:8444` to each BIG-IP's management GUI. |
+| `bastionPublicIp`, `bastionHostInstanceId` | Only when `provisionBastion=true`. |
 | `cfeS3Bucket`, `bigIpSecretArn`, `bigIpKeyPairName`, `amiId` | As in `failover.yaml`. |
 
 ## Deploying this Solution
@@ -116,8 +124,9 @@ and `restrictedSrcAddressApp` in the parameters file first.
 
 ## Validation
 
-[AIRGAP-GUIDE.md](AIRGAP-GUIDE.md) has the full procedure. The short form, on the active
-device:
+[AIRGAP-GUIDE.md](AIRGAP-GUIDE.md) has the full procedure. The short form: paste the
+`ssmPortForwardBigIp01` output into a terminal, open `https://localhost:8443`, then on the
+active device:
 
 ```bash
 # CFE must list the VIP route - "routes" must NOT be empty
