@@ -482,11 +482,36 @@ Defaults below reflect this solution as configured for GovCloud. Anything marked
 | `bigIpRuntimeInitConfig01` / `02` | URL of each BIG-IP's runtime-init config. **Leave blank** to auto-derive from `s3BucketName`/`s3BucketRegion`/`artifactLocation`. Set only to bring your own BIG-IP config. |
 | `bigIpRuntimeInitPackageUrl` | URL of the runtime-init installer. **Leave blank** to auto-derive. |
 | `bigIpPeerAddr` | Address the second BIG-IP uses to reach the first for clustering (the first instance's management IP). | Leave at default unless you change the IP scheme. |
-| `bigIpMgmtAddress01/02`, `bigIpExternalSelfIp01/02`, `bigIpInternalSelfIp01/02`, `bigIpExternalVip01/02` | Static private IPs for each interface/VIP. | Leave at default unless you change the subnet layout. |
+| `bigIpMgmtAddress01/02`, `bigIpExternalSelfIp01/02`, `bigIpInternalSelfIp01/02`, `bigIpExternalVip01/02` | Static private IPs for each interface/VIP. | Leave at default unless you change the subnet layout. If you change `bigIpExternalVip01/02` you **must** also change `cfeVipTag` — see the callout below. |
 | `bigIpHostname01/02` | Device hostnames (`failover01.local` / `failover02.local`). | Leave at default. |
 | `cfeS3Bucket` | CFE failover-state bucket. **Leave blank** — the stack auto-creates and tags it (`<uniqueString>-bigip-high-availability-solution`). **Do not pre-create it.** |
+| `cfeTag` | Value written to the `f5_cloud_failover_label` tag on the NICs, EIPs, and (for route-based failover) route tables that CFE is allowed to manage. Must match the `scopingTags` value in the CFE declaration inside the runtime-init config. |
+| `cfeVipTag` | Comma-separated list of the per-AZ private VIP addresses, written to the application VIP's EIP as the `f5_cloud_failover_vips` tag. Default `10.0.0.101,10.0.4.101`. **Must match `bigIpExternalVip01/02`** — see the callout below. |
 | `uniqueString` | Prefix for named resources (IAM roles, key pair, etc.). | Use a **fresh** value per deployment to avoid IAM name collisions. |
 | `application`, `cost`, `environment`, `group`, `owner` | Resource tags. | Set per your tagging policy. |
+
+> ### ⚠️ `cfeVipTag` must match `bigIpExternalVip01/02`
+> The two BIG-IPs sit in **different Availability Zones**, so their external interfaces are in different subnets and the application VIP is really **two** addresses — `10.0.0.101` on instance 01 and `10.0.4.101` on instance 02. A secondary private IP belongs to its subnet's CIDR and cannot be reassigned to an interface in another subnet, so when the VIP is public CFE fails it over by moving the **EIP association** between those two addresses rather than moving the address itself. It discovers which addresses it may associate to by reading the `f5_cloud_failover_vips` tag on the EIP — and the template populates that tag from `cfeVipTag`.
+>
+> That address list is hardcoded in **three independent places**, and nothing derives one from the others:
+> - `cfeVipTag` — default `10.0.0.101,10.0.4.101`
+> - `bigIpExternalVip01` / `bigIpExternalVip02` — defaults `10.0.0.101` / `10.0.4.101`
+> - the AS3 `virtualAddress` entries in `bigip-configurations/runtime-init-conf-3nic-payg-instance01-with-app.yaml` and `…instance02-with-app.yaml`
+>
+> So if you change your subnet layout, update `bigIpExternalVip01/02` as the row above invites you to, and leave `cfeVipTag` at its default, the EIP ends up tagged with addresses that exist on neither device. CFE has nothing to match, **the EIP never moves, and nothing reports an error.** The stack still reaches CREATE_COMPLETE, clustering still goes green, and `cloud-failover/inspect` still returns cleanly — you find out at the first real failover. Change all three together, or leave all three alone.
+>
+> This applies only when `provisionPublicIpVip=true`. With the air-gap profile (`provisionPublicIpVip=false`) no VIP EIP is created and the tag is unused.
+
+After the stack completes, confirm the tag matches the addresses actually configured on the devices:
+
+```bash
+aws ec2 describe-addresses --region "$REGION" \
+  --filters "Name=tag:f5_cloud_failover_label,Values=bigip_high_availability_solution" \
+  --query 'Addresses[].[PublicIp,Tags[?Key==`f5_cloud_failover_vips`].Value|[0]]' \
+  --output table
+```
+
+The addresses it prints must be exactly your `bigIpExternalVip01` and `bigIpExternalVip02` values.
 
 ---
 
