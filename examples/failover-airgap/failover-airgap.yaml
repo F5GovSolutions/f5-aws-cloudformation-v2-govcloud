@@ -1,0 +1,1031 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Air-gap variant of the BIG-IP High Availability (failover) solution. No Elastic IPs are
+  created. The application VIP is an address outside the VPC CIDR, reached through route
+  table entries that F5 Cloud Failover Extension retargets to the active BIG-IP's external
+  interface on failover. VPC endpoints are always provisioned. Derived from
+  examples/failover/failover.yaml - see MAINTAINING.md for what is shared and what differs.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Templates Location
+        Parameters:
+          - s3BucketName
+          - s3BucketRegion
+          - artifactLocation
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - numAzs
+          - numSubnets
+          - subnetMask
+          - vpcCidr
+          - bigIpMgmtAddress01
+          - bigIpExternalSelfIp01
+          - bigIpInternalSelfIp01
+          - bigIpMgmtAddress02
+          - bigIpExternalSelfIp02
+          - bigIpInternalSelfIp02
+          - bigIpPeerAddr
+      - Label:
+          default: Amazon EC2 Configuration
+        Parameters:
+          - sshKey
+          - bigIpInstanceProfile
+      - Label:
+          default: Application VIP (route-based failover)
+        Parameters:
+          - externalVipAddress
+          - externalVipCidr
+      - Label:
+          default: Management access / Ingress
+        Parameters:
+          - provisionSsmAccess
+          - provisionBastion
+          - restrictedSrcAddressMgmt
+          - restrictedSrcAddressApp
+      - Label:
+          default: BIG-IP Configuration
+        Parameters:
+          - bigIpRuntimeInitPackageUrl
+          - bigIpRuntimeInitConfig01
+          - bigIpRuntimeInitConfig02
+          - bigIpHostname01
+          - bigIpHostname02
+          - bigIpLicenseKey01
+          - bigIpLicenseKey02
+          - bigIpImage
+          - bigIpCustomImageId
+          - bigIpInstanceType
+          - numNics
+          - bigIpSecretArn
+          - cfeS3Bucket
+          - cfeTag
+          - allowUsageAnalytics
+      - Label:
+          default: Application Configuration
+        Parameters:
+          - appDockerImageName
+          - provisionExampleApp
+      - Label:
+          default: Resources Tags
+        Parameters:
+          - uniqueString
+          - application
+          - cost
+          - environment
+          - group
+          - owner
+    ParameterLabels:
+      allowUsageAnalytics:
+        default: Send anonymous statistics to F5
+      appDockerImageName:
+        default: Application docker image name
+      application:
+        default: Application
+      artifactLocation:
+        default: Path to directory where the modules folder is located. ex. "examples/"
+      bigIpCustomImageId:
+        default: Custom Image Id
+      bigIpHostname01:
+        default: Hostname for BIG-IP instance 01
+      bigIpHostname02:
+        default: Hostname for BIG-IP instance 02
+      bigIpImage:
+        default: F5 BIG-IP Image
+      bigIpInstanceType:
+        default: Enter valid instance type.
+      bigIpInstanceProfile:
+        default: Instance profile
+      bigIpLicenseKey01:
+        default: License key for BIG-IP instance 01
+      bigIpLicenseKey02:
+        default: License key for BIG-IP instance 02
+      bigIpPeerAddr:
+        default: Static self IP address for peer device.
+      bigIpRuntimeInitConfig01:
+        default: BIG-IP Runtime Init config used for BIGIP instance A
+      bigIpRuntimeInitConfig02:
+        default: BIG-IP Runtime Init config used for BIGIP instance B
+      bigIpRuntimeInitPackageUrl:
+        default: Runtime Init Package
+      cfeS3Bucket:
+        default: CFE S3 bucket
+      cfeTag:
+        default: CFE Deployment tag value
+      cost:
+        default: Cost Center
+      environment:
+        default: Environment
+      externalVipAddress:
+        default: Application VIP address (outside the VPC CIDR)
+      externalVipCidr:
+        default: VIP prefix routed to the active BIG-IP (must contain the VIP address)
+      bigIpExternalSelfIp01:
+        default: External private ip address for BIGIP instance A
+      bigIpExternalSelfIp02:
+        default: External private ip address for BIGIP instance B
+      group:
+        default: Group
+      bigIpInternalSelfIp01:
+        default: Internal private ip address for BIGIP instance A
+      bigIpInternalSelfIp02:
+        default: Internal private ip address for BIGIP instance B
+      bigIpMgmtAddress01:
+        default: Management private ip address for BIGIP instance A
+      bigIpMgmtAddress02:
+        default: Management private ip address for BIGIP instance B
+      bigIpSecretArn:
+        default: ARN of Secrets Manager secret
+      numAzs:
+        default: Number of Availability Zones
+      numNics:
+        default: Interfaces
+      numSubnets:
+        default: Number of Subnets
+      owner:
+        default: Owner
+      provisionBastion:
+        default: Provision a public bastion host (fallback when Session Manager is not available)
+      provisionSsmAccess:
+        default: Provision Session Manager access (private jump host + SSM endpoints)
+      provisionExampleApp:
+        default: Provision Example App
+      restrictedSrcAddressApp:
+        default: Restricted Source Address to Application
+      restrictedSrcAddressMgmt:
+        default: Restricted Source Address to BIG-IP
+      s3BucketName:
+        default: S3 Bucket where Templates are Located
+      s3BucketRegion:
+        default: S3 Bucket Region where Templates are Located
+      sshKey:
+        default: Supply the public key that will be used for SSH authentication to
+          the BIG-IP and application virtual machines
+      subnetMask:
+        default: Subnet Mask
+      uniqueString:
+        default: Unique string
+      vpcCidr:
+        default: VPC CIDR
+  Version: 3.6.0.0
+Outputs:
+  amiId:
+    Condition: noCustomImageId
+    Description: Ami lookup returned ami id.
+    Value: !GetAtt [AmiInfo, Id]
+  bastionHostInstanceId:
+    Condition: deployBastion
+    Description: bastion instance id
+    Value: !GetAtt [Bastion, Outputs.bastionInstanceId]
+  bastionPublicIp:
+    Condition: deployBastion
+    Description: bastion's public IP address
+    Value: !GetAtt [Bastion, Outputs.bastionPublicIp]
+  bigIpInstance01:
+    Description: BIGIP instance A nested stack name
+    Value: !GetAtt [BigIpInstance01, Outputs.stackName]
+  bigIpInstanceMgmtPrivateIp01:
+    Description: private management ip for BIGIP instance A
+    Value: !GetAtt [BigIpInstance01, Outputs.bigIpManagementInterfacePrivateIp]
+  bigIpExternalInterfaceId01:
+    Description: External network interface (eth1) of BIG-IP instance A - the initial
+      target of the VIP routes
+    Value: !GetAtt [BigIpInstance01, Outputs.bigIpExternalInterfaceId]
+  bigIpExternalInterfaceId02:
+    Description: External network interface (eth1) of BIG-IP instance B
+    Value: !GetAtt [BigIpInstance02, Outputs.bigIpExternalInterfaceId]
+  bigIpInstance02:
+    Description: BIGIP instance B nested stack name
+    Value: !GetAtt [BigIpInstance02, Outputs.stackName]
+  bigIpInstanceMgmtPrivateIp02:
+    Description: private management ip for BIGIP instance B
+    Value: !GetAtt [BigIpInstance02, Outputs.bigIpManagementInterfacePrivateIp]
+  bigIpKeyPairName:
+    Condition: createKeyPair
+    Description: SSH key pair name
+    Value: !GetAtt [Access, Outputs.keyPairName]
+  bigIpSecretArn:
+    Condition: createSecret
+    Description: Secret ARN
+    Value: !GetAtt [Access, Outputs.secretArn]
+  cfeS3Bucket:
+    Description: cfe s3 bucket created and used for cloud-failover-extension
+    Value: !If
+      - useDefaultCfeS3Bucket
+      - !Join
+        - ''
+        - - !Ref 'uniqueString'
+          - '-bigip-high-availability-solution'
+      - !Ref 'cfeS3Bucket'
+  ssmJumpInstanceId:
+    Condition: deploySsm
+    Description: SSM-managed private jump host. "aws ssm start-session --target <id>" opens a
+      shell on it; the ssmPortForward* outputs reach the BIG-IP management interfaces
+    Value: !GetAtt [SsmJump, Outputs.ssmJumpInstanceId]
+  ssmPortForwardBigIp01:
+    Condition: deploySsm
+    Description: Forwards localhost:8443 to BIG-IP instance A management (GUI at https://localhost:8443)
+    Value: !Sub
+      - >-
+        aws ssm start-session --region ${AWS::Region} --target ${JUMP}
+        --document-name AWS-StartPortForwardingSessionToRemoteHost
+        --parameters '{"host":["${MGMT}"],"portNumber":["443"],"localPortNumber":["8443"]}'
+      - JUMP: !GetAtt [SsmJump, Outputs.ssmJumpInstanceId]
+        MGMT: !GetAtt [BigIpInstance01, Outputs.bigIpManagementInterfacePrivateIp]
+  ssmPortForwardBigIp02:
+    Condition: deploySsm
+    Description: Forwards localhost:8444 to BIG-IP instance B management (GUI at https://localhost:8444)
+    Value: !Sub
+      - >-
+        aws ssm start-session --region ${AWS::Region} --target ${JUMP}
+        --document-name AWS-StartPortForwardingSessionToRemoteHost
+        --parameters '{"host":["${MGMT}"],"portNumber":["443"],"localPortNumber":["8444"]}'
+      - JUMP: !GetAtt [SsmJump, Outputs.ssmJumpInstanceId]
+        MGMT: !GetAtt [BigIpInstance02, Outputs.bigIpManagementInterfacePrivateIp]
+  vipAddress:
+    Description: Application VIP. Reachable from inside the VPC, and from any network that
+      routes vipRouteCidr into it. Never a public address.
+    Value: !Ref 'externalVipAddress'
+  vipRouteCidr:
+    Description: Prefix routed to the active BIG-IP and managed by Cloud Failover Extension
+    Value: !Ref 'externalVipCidr'
+  vipRouteTableIds:
+    Description: Route tables carrying the VIP route (tagged f5_cloud_failover_label=cfeTag)
+    Value: !If
+      - twoAzs
+      - !Join [',', [!GetAtt [Network, Outputs.publicSubnetRouteTableId], !GetAtt [Network, Outputs.privateRouteTableIdA], !GetAtt [Network, Outputs.privateRouteTableIdB]]]
+      - !Join [',', [!GetAtt [Network, Outputs.publicSubnetRouteTableId], !GetAtt [Network, Outputs.privateRouteTableIdA]]]
+Parameters:
+  allowUsageAnalytics:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+    Description: This deployment can send anonymous statistics to F5 to help us determine
+      how to improve our solutions. If you select **false** statistics are not sent.
+    Type: String
+  appDockerImageName:
+    Default: 'f5devcentral/f5-demo-app:latest'
+    Description: Application docker image name
+    Type: String
+  application:
+    Default: f5app
+    Description: Application Tag.
+    Type: String
+  artifactLocation:
+    AllowedPattern: ^.*[0-9a-zA-Z]+/$
+    ConstraintDescription: key prefix can include numbers, lowercase letters, uppercase
+      letters, hyphens (-), and forward slash (/).
+    Default: f5-aws-cloudformation-v2/v3.6.0.0/examples/
+    Description: The path in the S3Bucket where the modules folder is located. Can
+      include numbers, lowercase letters, uppercase letters, hyphens (-), and forward
+      slash (/).
+    Type: String
+  bigIpCustomImageId:
+    Default: ''
+    Description: Provide BIG-IP AMI ID you wish to deploy.
+    MaxLength: 255
+    Type: String
+  bigIpHostname01:
+    ConstraintDescription: Must be a valid hostname containing fewer than 63 characters.
+    Default: 'failover01.local'
+    Description: Supply the hostname you would like to use for the BIG-IP instance.
+      The hostname must contain fewer than 63 characters.
+    MaxLength: 63
+    Type: String
+  bigIpHostname02:
+    ConstraintDescription: Must be a valid hostname containing fewer than 63 characters.
+    Default: 'failover02.local'
+    Description: Supply the hostname you would like to use for the BIG-IP instance.
+      The hostname must contain fewer than 63 characters.
+    MaxLength: 63
+    Type: String
+  bigIpImage:
+    ConstraintDescription: Must be a valid F5 BIG-IP market place image
+    Default: '*17.5.1.6-0.0.25*PAYG-Best Plus 25Mbps*'
+    Description: F5 BIG-IP market place image
+    Type: String
+  bigIpInstanceProfile:
+    Default: ''
+    Description: Enter the name of an existing IAM instance profile with applied IAM
+      policy to be associated to the BIG-IP virtual machine(s). Leave default to create
+      a new instance profile.
+    Type: String
+  bigIpInstanceType:
+    ConstraintDescription: Must be a valid EC2 instance type for BIG-IP
+    Default: m5.xlarge
+    Description: Enter valid instance type.
+    Type: String
+  bigIpLicenseKey01:
+    Default: ''
+    Description: Supply the F5 BYOL license key for BIG-IP instance 01. Leave this
+      parameter blank if deploying the PAYG solution.
+    Type: String
+  bigIpLicenseKey02:
+    Default: ''
+    Description: Supply the F5 BYOL license key for BIG-IP instance 02. Leave this
+      parameter blank if deploying the PAYG solution.
+    Type: String
+  bigIpPeerAddr:
+    Default: '10.0.1.11'
+    Description: Provide the static address of the remote peer used for clustering.
+      In this failover solution, clustering is initiated from the second instance
+      (02) to the first instance (01) so you would provide the first instances Self
+      IP address.
+    Type: String
+  bigIpRuntimeInitConfig01:
+    Default: ''
+    Description: 'Supply a URL to the bigip-runtime-init configuration file (YAML/JSON)
+      for BIG-IP instance 01. Leave blank to auto-derive from s3BucketName /
+      s3BucketRegion / artifactLocation (the staged config in your bucket).'
+    Type: String
+  bigIpRuntimeInitConfig02:
+    Default: ''
+    Description: 'Supply a URL to the bigip-runtime-init configuration file (YAML/JSON)
+      for BIG-IP instance 02. Leave blank to auto-derive from s3BucketName /
+      s3BucketRegion / artifactLocation (the staged config in your bucket).'
+    Type: String
+  bigIpRuntimeInitPackageUrl:
+    Default: ''
+    Description: URL for the BIG-IP Runtime Init package. Leave blank to auto-derive from
+      s3BucketName / s3BucketRegion / artifactLocation (the staged package in your bucket).
+    Type: String
+  cfeS3Bucket:
+    AllowedPattern: '^$|^(?=.{1,61}$)[0-9a-z]+([0-9a-z-.]*[0-9a-z])*$'
+    ConstraintDescription: 'S3 bucket name must be unique, can be between 3 and 63
+      characters long, and can contain only lower-case characters, numbers, periods,
+      and dashes. It cannot contain underscores, end with a dash, have consecutive
+      periods, or use dashes adjacent to periods.'
+    Default: ''
+    Description: 'Supply a unique name for a CFE S3 bucket created and used by Cloud
+      Failover Extension.'
+    Type: String
+  cfeTag:
+    Description: Cloud Failover deployment tag value.
+    Type: String
+    Default: bigip_high_availability_solution
+  cost:
+    Default: f5cost
+    Description: Cost Center Tag.
+    Type: String
+  environment:
+    Default: f5env
+    Description: Environment Tag.
+    Type: String
+  externalVipAddress:
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+    ConstraintDescription: IP address parameter must be in the form x.x.x.x
+    Default: 10.99.0.100
+    Description: The application VIP. Must be OUTSIDE the VPC CIDR and inside externalVipCidr.
+      Clients reach it through a route table entry targeting the active BIG-IP's external
+      interface; Cloud Failover Extension retargets that route on failover. Must not collide
+      with any prefix reachable from the VPC, including on-premises ranges arriving over
+      Direct Connect, VPN, or Transit Gateway.
+    Type: String
+  externalVipCidr:
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/0-32
+    Default: 10.99.0.0/24
+    Description: Prefix, outside the VPC CIDR, routed to the active BIG-IP. One route for
+      exactly this prefix is created in each route table, and the Cloud Failover Extension
+      declaration manages routes for exactly this prefix (its prefix matching is exact).
+      Must contain externalVipAddress.
+    Type: String
+  bigIpExternalSelfIp01:
+    AllowedPattern: '^$|^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+    ConstraintDescription: IP address parameter must be in the form x.x.x.x
+    Description: External Private IP Address for BIGIP instance A.
+    Default: 10.0.0.11
+    Type: String
+  bigIpExternalSelfIp02:
+    AllowedPattern: '^$|^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+    ConstraintDescription: IP address parameter must be in the form x.x.x.x
+    Description: External Private IP Address for BIGIP instance B.
+    Default: 10.0.4.11
+    Type: String
+  group:
+    Default: f5group
+    Description: Group Tag.
+    Type: String
+  bigIpInternalSelfIp01:
+    AllowedPattern: '^$|^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+    ConstraintDescription: IP address parameter must be in the form x.x.x.x
+    Description: Internal Private IP Address for BIGIP instance A.
+    Default: 10.0.2.11
+    Type: String
+  bigIpInternalSelfIp02:
+    AllowedPattern: '^$|^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+    ConstraintDescription: IP address parameter must be in the form x.x.x.x
+    Description: Internal Private IP Address for BIGIP instance B.
+    Default: 10.0.6.11
+    Type: String
+  bigIpMgmtAddress01:
+    AllowedPattern: '^$|^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+    ConstraintDescription: IP address parameter must be in the form x.x.x.x
+    Description: Management Private IP Address for BIGIP instance A.
+    Default: 10.0.1.11
+    Type: String
+  bigIpMgmtAddress02:
+    AllowedPattern: '^$|^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+    ConstraintDescription: IP address parameter must be in the form x.x.x.x
+    Description: Management Private IP Address for BIGIP instance B.
+    Default: 10.0.5.11
+    Type: String
+  bigIpSecretArn:
+    Default: ''
+    Description: The ARN of an existing AWS Secrets Manager secret where the BIG-IP
+      password used for clustering is stored. If left empty, a secret will be created.
+    Type: String
+  numAzs:
+    Default: 2
+    Description: Number of Availability Zones to use in the VPC. Region must support
+      number of availability zones entered. Min 1 Max 2.
+    MaxValue: 2
+    MinValue: 1
+    Type: Number
+  numNics:
+    AllowedValues:
+      - 2
+      - 3
+    Default: 3
+    Description: Number of interfaces to create on BIG-IP instance. Maximum of 3 allowed.
+      Minimum of 2 allowed.
+    Type: Number
+  numSubnets:
+    Default: 4
+    Description: Indicate the number of subnets to create. A minimum of 4 subnets
+      required when provisionExampleApp = false
+    MaxValue: 8
+    MinValue: 2
+    Type: Number
+  owner:
+    Default: f5owner
+    Description: Owner Tag.
+    Type: String
+  provisionBastion:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+    Description: Fallback for environments where Systems Manager is not available. Deploys
+      the Linux bastion host (modules/bastion) in the first external subnet with a public
+      IP address and SSH open to restrictedSrcAddressMgmt. This puts a public address and an
+      open port into the air gap; prefer provisionSsmAccess.
+    Type: String
+  provisionSsmAccess:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: Deploys a private jump host managed by AWS Systems Manager Session Manager
+      (modules/ssm-jump) in the BIG-IP management subnet, plus the ssm, ssmmessages and
+      ec2messages VPC endpoints it needs. The host has no public IP, no inbound rules and
+      no SSH key; operators reach the BIG-IP management interfaces by port-forwarding
+      through it with "aws ssm start-session". Set to false only if management is reached
+      over private connectivity (Direct Connect, VPN, Transit Gateway).
+    Type: String
+  provisionExampleApp:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+    Description: Flag to deploy the demo web application.
+    Type: String
+  restrictedSrcAddressMgmt:
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x.
+    Description: REQUIRED - The IP address range used to SSH and access management
+      GUI on the EC2 instances.
+    MaxLength: '18'
+    MinLength: '9'
+    Type: String
+  restrictedSrcAddressApp:
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x.
+    Description: REQUIRED - The IP address range that can be used to access web traffic
+      (80/443) to the EC2 instances.
+    MaxLength: '18'
+    MinLength: '9'
+    Type: String
+  s3BucketName:
+    AllowedPattern: ^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$
+    ConstraintDescription: >-
+      S3 bucket name can include numbers, lowercase letters, uppercase letters, and
+      hyphens (-). It cannot start or end with a hyphen (-).
+    Default: f5-cft-gov
+    Description: >-
+      REQUIRED - S3 bucket name for the modules. S3 bucket name can include numbers,
+      lowercase letters, uppercase letters, and hyphens (-). It cannot start or end
+      with a hyphen (-).
+    Type: String
+  s3BucketRegion:
+    Default: us-gov-east-1
+    Description: The AWS Region where the Quick Start S3 bucket (s3BucketName) is
+      hosted. When using your own bucket, you must specify this value.
+    Type: String
+  sshKey:
+    Default: ''
+    Description: Supply the public key that will be used for SSH authentication to
+      the BIG-IP, application, and bastion virtual machines. If left empty, one will
+      be created.
+    Type: String
+  subnetMask:
+    ConstraintDescription: 'Subnet mask must be in value of 16-28. Total number of
+      subnets created from VPC must be greater than or equal to number of regions
+      multiplied by number of subnets. Example: 4 AZ with 8 subnets requires VPC supernetting
+      support 32 subnets.'
+    Default: 24
+    Description: 'Mask for subnets. Valid values include 16-28. Note supernetting
+      of VPC occurs based on mask provided; therefore, number of networks must be
+      >= to the number of subnets created. Mask for subnets. Valid values include
+      16-28.'
+    MaxValue: 28
+    MinValue: 16
+    Type: Number
+  uniqueString:
+    ConstraintDescription: 'Must contain between 1 and 12 lowercase alphanumeric characters
+      with first character as a letter.'
+    AllowedPattern: ^[a-z][a-z0-9]{1,11}$
+    Description: Unique String used when creating object names or Tags.
+    Type: String
+    Default: myuniqstr
+  vpcCidr:
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+    ConstraintDescription: CIDR block parameter must be in the form x.x.x.x/16-28
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+    Type: String
+Conditions:
+  2nic: !Or
+    - !Condition '3nic'
+    - !Equals
+      - 2
+      - !Ref 'numNics'
+  3nic: !Equals
+    - 3
+    - !Ref 'numNics'
+  createBigIpInstanceProfile: !Equals
+    - !Ref 'bigIpInstanceProfile'
+    - ""
+  createKeyPair: !Equals
+    - ''
+    - !Ref 'sshKey'
+  createSecret: !Equals
+    - ''
+    - !Ref 'bigIpSecretArn'
+  noCustomImageId: !Equals
+    - ''
+    - !Ref 'bigIpCustomImageId'
+  sameAz: !Equals
+    - '1'
+    - !Ref 'numAzs'
+  useDefaultCfeS3Bucket: !Equals
+    - !Ref 'cfeS3Bucket'
+    - ''
+  deployBastion: !Equals
+    - 'true'
+    - !Ref 'provisionBastion'
+  deploySsm: !Equals
+    - 'true'
+    - !Ref 'provisionSsmAccess'
+  twoAzs: !Not
+    - !Condition sameAz
+  deployExampleApp: !Equals
+    - 'true'
+    - !Ref 'provisionExampleApp'
+  useDefaultRuntimeInitConfig01: !Equals
+    - !Ref 'bigIpRuntimeInitConfig01'
+    - ''
+  useDefaultRuntimeInitConfig02: !Equals
+    - !Ref 'bigIpRuntimeInitConfig02'
+    - ''
+  useDefaultRuntimeInitPackage: !Equals
+    - !Ref 'bigIpRuntimeInitPackageUrl'
+    - ''
+Resources:
+  Access:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/access/access.yaml'
+        - S3Region: !Ref 's3BucketRegion'
+          S3Bucket: !Ref 's3BucketName'
+      Parameters:
+        cfeTag: !Ref 'cfeTag'
+        createAmiRole: 'true'
+        createBigIpRoles: !If [createBigIpInstanceProfile, 'true', 'false']
+        createSecret: !If [createSecret, 'true', 'false']
+        createSshKey: !If [createKeyPair, 'true', 'false']
+        s3Bucket: !If
+          - useDefaultCfeS3Bucket
+          - !Join
+            - ''
+            - - !Ref 'uniqueString'
+              - '-bigip-high-availability-solution'
+          - !Ref 'cfeS3Bucket'
+        secretArn: !If [createSecret, !Ref 'AWS::NoValue', !Ref 'bigIpSecretArn']
+        solutionType: failover
+        uniqueString: !Ref 'uniqueString'
+        application: !Ref 'application'
+        cost: !Ref 'cost'
+        environment: !Ref 'environment'
+        group: !Ref 'group'
+        owner: !Ref 'owner'
+  AmiInfo:
+    Type: 'Custom::AMIInfo'
+    Condition: noCustomImageId
+    Properties:
+      OSName: !Ref 'bigIpImage'
+      OwnerId: 'aws-marketplace'
+      Region: !Ref 'AWS::Region'
+      ServiceToken: !GetAtt [Function, Outputs.lambdaARN]
+  Application:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: deployExampleApp
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/application/application.yaml'
+        - S3Region: !Ref 's3BucketRegion'
+          S3Bucket: !Ref 's3BucketName'
+      Parameters:
+        appContainerName: !Ref 'appDockerImageName'
+        applicationSubnet: !Join
+          - ','
+          - - !Select
+              - '3'
+              - !Split
+                - ','
+                - !GetAtt
+                  - Network
+                  - Outputs.subnetsA
+        appSecurityGroupId: !GetAtt [Dag, Outputs.appSecurityGroupId]
+        sshKey: !If [createKeyPair, !GetAtt [Access, Outputs.keyPairName], !Ref 'sshKey']
+        restrictedSrcAddress: !Ref 'restrictedSrcAddressApp'
+        uniqueString: !Ref 'uniqueString'
+        vpc: !GetAtt
+          - Network
+          - Outputs.vpcId
+        application: !Ref 'application'
+        cost: !Ref 'cost'
+        environment: !Ref 'environment'
+        group: !Ref 'group'
+        owner: !Ref 'owner'
+  Bastion:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: deployBastion
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/bastion/bastion.yaml'
+        - S3Region: !Ref 's3BucketRegion'
+          S3Bucket: !Ref 's3BucketName'
+      Parameters:
+        mgmtSubnet: !Join
+          - ','
+          - - !Select
+              - '0'
+              - !Split
+                - ','
+                - !GetAtt
+                  - Network
+                  - Outputs.subnetsA
+        bastionSecurityGroupId: !GetAtt
+          - Dag
+          - Outputs.bastionSecurityGroupId
+        sshKey: !If [createKeyPair, !GetAtt [Access, Outputs.keyPairName], !Ref 'sshKey']
+        restrictedSrcAddress: !Ref 'restrictedSrcAddressMgmt'
+        uniqueString: !Ref 'uniqueString'
+        vpc: !GetAtt
+          - Network
+          - Outputs.vpcId
+        application: !Ref 'application'
+        cost: !Ref 'cost'
+        environment: !Ref 'environment'
+        group: !Ref 'group'
+        owner: !Ref 'owner'
+  BigIpInstance01:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/bigip-standalone/bigip-standalone.yaml'
+        - S3Region: !Ref 's3BucketRegion'
+          S3Bucket: !Ref 's3BucketName'
+      Parameters:
+        allowUsageAnalytics: !Ref 'allowUsageAnalytics'
+        bigIpPeerAddr: !Ref 'bigIpPeerAddr'
+        bigIpPeerHostname: !Ref 'bigIpHostname02'
+        bigIpRuntimeInitPackageUrl: !If
+          - useDefaultRuntimeInitPackage
+          - !Sub
+            - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}f5-bigip-runtime-init-2.0.3-1.gz.run'
+            - S3Region: !Ref 's3BucketRegion'
+              S3Bucket: !Ref 's3BucketName'
+          - !Ref 'bigIpRuntimeInitPackageUrl'
+        bigIpRuntimeInitConfig: !If
+          - useDefaultRuntimeInitConfig01
+          - !Sub
+            - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}failover-airgap/bigip-configurations/runtime-init-conf-3nic-payg-instance01-airgap.yaml'
+            - S3Region: !Ref 's3BucketRegion'
+              S3Bucket: !Ref 's3BucketName'
+          - !Ref 'bigIpRuntimeInitConfig01'
+        cfeS3Bucket: !If
+          - useDefaultCfeS3Bucket
+          - !Join
+            - ''
+            - - !Ref 'uniqueString'
+              - '-bigip-high-availability-solution'
+          - !Ref 'cfeS3Bucket'
+        cfeTag: !Ref 'cfeTag'
+        bigIpPeerExternalSelfIp: !Ref 'bigIpExternalSelfIp02'
+        disableSourceDestCheck: 'true'
+        externalSelfPublicIpId: ''
+        externalServicePublicIpIds: ''
+        externalVipAddress: !Ref 'externalVipAddress'
+        externalVipCidr: !Ref 'externalVipCidr'
+        externalSecurityGroupId: !GetAtt [Dag, Outputs.bigIpExternalSecurityGroup]
+        externalSelfIp: !Ref 'bigIpExternalSelfIp01'
+        externalServiceIps: ''
+        externalSubnetId: !Join
+          - ','
+          - - !Select
+              - '0'
+              - !Split
+                - ','
+                - !GetAtt
+                  - Network
+                  - Outputs.subnetsA
+        hostname: !Ref 'bigIpHostname01'
+        imageId: !If
+          - noCustomImageId
+          - !GetAtt
+            - AmiInfo
+            - Id
+          - !Ref 'bigIpCustomImageId'
+        instanceIndex: '01'
+        instanceProfile: !If
+          - createBigIpInstanceProfile
+          - !GetAtt
+            - Access
+            - Outputs.bigIpInstanceProfile
+          - !Ref 'bigIpInstanceProfile'
+        instanceType: !Ref 'bigIpInstanceType'
+        internalSecurityGroupId: !If [3nic, !GetAtt [Dag, Outputs.bigIpInternalSecurityGroup],
+          !Ref 'AWS::NoValue']
+        internalSelfIp: !If [3nic, !Ref 'bigIpInternalSelfIp01', !Ref 'AWS::NoValue']
+        internalSubnetId: !If
+          - 3nic
+          - !Join
+            - ','
+            - - !Select
+                - '2'
+                - !Split
+                  - ','
+                  - !GetAtt
+                    - Network
+                    - Outputs.subnetsA
+          - !Ref 'AWS::NoValue'
+        licenseKey: !Ref 'bigIpLicenseKey01'
+        mgmtPublicIpId: ''
+        mgmtSecurityGroupId: !GetAtt [Dag, Outputs.bigIpMgmtSecurityGroup]
+        mgmtAddress: !Ref 'bigIpMgmtAddress01'
+        mgmtSubnetId: !Join
+          - ','
+          - - !Select
+              - '1'
+              - !Split
+                - ','
+                - !GetAtt
+                  - Network
+                  - Outputs.subnetsA
+        numExternalPublicIpAddresses: 0
+        numSecondaryPrivateIpAddresses: 0
+        secretArn: !If [createSecret, !GetAtt [Access, Outputs.secretArn], !Ref 'bigIpSecretArn']
+        sshKey: !If [createKeyPair, !GetAtt [Access, Outputs.keyPairName], !Ref 'sshKey']
+        uniqueString: !Ref 'uniqueString'
+        application: !Ref 'application'
+        cost: !Ref 'cost'
+        environment: !Ref 'environment'
+        group: !Ref 'group'
+        owner: !Ref 'owner'
+  BigIpInstance02:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/bigip-standalone/bigip-standalone.yaml'
+        - S3Region: !Ref 's3BucketRegion'
+          S3Bucket: !Ref 's3BucketName'
+      Parameters:
+        allowUsageAnalytics: !Ref 'allowUsageAnalytics'
+        bigIpPeerAddr: !Ref 'bigIpPeerAddr'
+        bigIpPeerHostname: !Ref 'bigIpHostname01'
+        bigIpRuntimeInitPackageUrl: !If
+          - useDefaultRuntimeInitPackage
+          - !Sub
+            - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}f5-bigip-runtime-init-2.0.3-1.gz.run'
+            - S3Region: !Ref 's3BucketRegion'
+              S3Bucket: !Ref 's3BucketName'
+          - !Ref 'bigIpRuntimeInitPackageUrl'
+        bigIpRuntimeInitConfig: !If
+          - useDefaultRuntimeInitConfig02
+          - !Sub
+            - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}failover-airgap/bigip-configurations/runtime-init-conf-3nic-payg-instance02-airgap.yaml'
+            - S3Region: !Ref 's3BucketRegion'
+              S3Bucket: !Ref 's3BucketName'
+          - !Ref 'bigIpRuntimeInitConfig02'
+        cfeTag: !Ref 'cfeTag'
+        bigIpPeerExternalSelfIp: !Ref 'bigIpExternalSelfIp01'
+        disableSourceDestCheck: 'true'
+        externalSelfPublicIpId: ''
+        externalServicePublicIpIds: ''
+        externalVipAddress: !Ref 'externalVipAddress'
+        externalVipCidr: !Ref 'externalVipCidr'
+        externalSecurityGroupId: !GetAtt [Dag, Outputs.bigIpExternalSecurityGroup]
+        externalSelfIp: !Ref 'bigIpExternalSelfIp02'
+        externalServiceIps: ''
+        externalSubnetId: !Join
+          - ','
+          - - !Select
+              - '0'
+              - !Split
+                - ','
+                - !If [sameAz, !GetAtt [Network, Outputs.subnetsA], !GetAtt [Network,
+                    Outputs.subnetsB]]
+        hostname: !Ref 'bigIpHostname02'
+        imageId: !If
+          - noCustomImageId
+          - !GetAtt
+            - AmiInfo
+            - Id
+          - !Ref 'bigIpCustomImageId'
+        instanceIndex: '02'
+        instanceProfile: !If
+          - createBigIpInstanceProfile
+          - !GetAtt
+            - Access
+            - Outputs.bigIpInstanceProfile
+          - !Ref 'bigIpInstanceProfile'
+        instanceType: !Ref 'bigIpInstanceType'
+        internalSecurityGroupId: !If [3nic, !GetAtt [Dag, Outputs.bigIpInternalSecurityGroup],
+          !Ref 'AWS::NoValue']
+        internalSelfIp: !If [3nic, !Ref 'bigIpInternalSelfIp02', !Ref 'AWS::NoValue']
+        internalSubnetId: !If
+          - 3nic
+          - !Join
+            - ','
+            - - !Select
+                - '2'
+                - !Split
+                  - ','
+                  - !If [sameAz, !GetAtt [Network, Outputs.subnetsA], !GetAtt [Network,
+                      Outputs.subnetsB]]
+          - !Ref 'AWS::NoValue'
+        licenseKey: !Ref 'bigIpLicenseKey02'
+        mgmtPublicIpId: ''
+        mgmtSecurityGroupId: !GetAtt [Dag, Outputs.bigIpMgmtSecurityGroup]
+        mgmtAddress: !Ref 'bigIpMgmtAddress02'
+        mgmtSubnetId: !Join
+          - ','
+          - - !Select
+              - '1'
+              - !Split
+                - ','
+                - !If [sameAz, !GetAtt [Network, Outputs.subnetsA], !GetAtt [Network,
+                    Outputs.subnetsB]]
+        numExternalPublicIpAddresses: 0
+        numSecondaryPrivateIpAddresses: 0
+        secretArn: !If [createSecret, !GetAtt [Access, Outputs.secretArn], !Ref 'bigIpSecretArn']
+        sshKey: !If [createKeyPair, !GetAtt [Access, Outputs.keyPairName], !Ref 'sshKey']
+        uniqueString: !Ref 'uniqueString'
+        application: !Ref 'application'
+        cost: !Ref 'cost'
+        environment: !Ref 'environment'
+        group: !Ref 'group'
+        owner: !Ref 'owner'
+  Dag:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub
+        - https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/dag/dag.yaml
+        - S3Region: !Ref 's3BucketRegion'
+          S3Bucket: !Ref 's3BucketName'
+      Parameters:
+        createAppSecurityGroup: true
+        createFailoverIngress: true
+        createInternalSecurityGroup: !If [3nic, 'true', 'false']
+        createExternalSecurityGroup: true
+        createBastionSecurityGroup: !If [deployBastion, true, false]
+        cfeTag: !Ref 'cfeTag'
+        cfeVipTag: ''
+        numberPublicExternalIpAddresses: 0
+        numberPublicMgmtIpAddresses: 0
+        provisionExternalBigipLoadBalancer: false
+        provisionInternalBigipLoadBalancer: false
+        restrictedSrcAddressApp: !Ref 'restrictedSrcAddressApp'
+        restrictedSrcAddressMgmt: !Ref 'restrictedSrcAddressMgmt'
+        restrictedSrcPort: 443
+        uniqueString: !Ref 'uniqueString'
+        vpc: !GetAtt
+          - Network
+          - Outputs.vpcId
+        vpcCidr: !Ref 'vpcCidr'
+        application: !Ref 'application'
+        cost: !Ref 'cost'
+        environment: !Ref 'environment'
+        group: !Ref 'group'
+        owner: !Ref 'owner'
+  Function:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/function/function.yaml'
+        - S3Region: !Ref 's3BucketRegion'
+          S3Bucket: !Ref 's3BucketName'
+      Parameters:
+        amiLookupRole: !GetAtt
+          - Access
+          - Outputs.lambdaAmiExecutionRole
+        createAmiLookupFunction: 'true'
+        uniqueString: !Ref 'uniqueString'
+        application: !Ref 'application'
+        cost: !Ref 'cost'
+        environment: !Ref 'environment'
+        group: !Ref 'group'
+        owner: !Ref 'owner'
+  Network:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/network/network.yaml'
+        - S3Region: !Ref 's3BucketRegion'
+          S3Bucket: !Ref 's3BucketName'
+      Parameters:
+        numAzs: !Ref 'numAzs'
+        numSubnets: !Ref 'numSubnets'
+        setPublicSubnet1: 'false'
+        provisionS3Endpoint: 'true'
+        provisionSsmEndpoints: !If [deploySsm, 'true', 'false']
+        routeTableFailoverTag: !Ref 'cfeTag'
+        subnetMask: !Ref 'subnetMask'
+        uniqueString: !Ref 'uniqueString'
+        vpcCidr: !Ref 'vpcCidr'
+        vpcTenancy: default
+        application: !Ref 'application'
+        cost: !Ref 'cost'
+        environment: !Ref 'environment'
+        group: !Ref 'group'
+        owner: !Ref 'owner'
+  SsmJump:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: deploySsm
+    Properties:
+      TemplateURL: !Sub
+        - 'https://${S3Bucket}.s3.${S3Region}.amazonaws.com/${artifactLocation}modules/ssm-jump/ssm-jump.yaml'
+        - S3Region: !Ref 's3BucketRegion'
+          S3Bucket: !Ref 's3BucketName'
+      Parameters:
+        subnetId: !Join
+          - ','
+          - - !Select
+              - '1'
+              - !Split
+                - ','
+                - !GetAtt
+                  - Network
+                  - Outputs.subnetsA
+        uniqueString: !Ref 'uniqueString'
+        vipCidr: !Ref 'externalVipCidr'
+        vpc: !GetAtt
+          - Network
+          - Outputs.vpcId
+        vpcCidr: !Ref 'vpcCidr'
+        application: !Ref 'application'
+        cost: !Ref 'cost'
+        environment: !Ref 'environment'
+        group: !Ref 'group'
+        owner: !Ref 'owner'
+  # Route-based VIP failover. One route per route table for externalVipCidr, initially
+  # targeting BIG-IP instance A's external interface. Cloud Failover Extension calls
+  # ec2:ReplaceRoute to retarget these routes on failover, so their live target WILL drift
+  # from what is declared here - that is by design. Never change these resources in a
+  # stack update (a property change would make CloudFormation re-point the route at
+  # instance A regardless of which device is active); to change the prefix, redeploy.
+  VipRoutePublic:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !GetAtt [Network, Outputs.publicSubnetRouteTableId]
+      DestinationCidrBlock: !Ref 'externalVipCidr'
+      NetworkInterfaceId: !GetAtt [BigIpInstance01, Outputs.bigIpExternalInterfaceId]
+  VipRoutePrivateA:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !GetAtt [Network, Outputs.privateRouteTableIdA]
+      DestinationCidrBlock: !Ref 'externalVipCidr'
+      NetworkInterfaceId: !GetAtt [BigIpInstance01, Outputs.bigIpExternalInterfaceId]
+  VipRoutePrivateB:
+    Type: 'AWS::EC2::Route'
+    Condition: twoAzs
+    Properties:
+      RouteTableId: !GetAtt [Network, Outputs.privateRouteTableIdB]
+      DestinationCidrBlock: !Ref 'externalVipCidr'
+      NetworkInterfaceId: !GetAtt [BigIpInstance01, Outputs.bigIpExternalInterfaceId]

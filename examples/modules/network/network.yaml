@@ -11,6 +11,16 @@ Conditions:
   deployS3Endpoint: !Equals
     - !Ref 'provisionS3Endpoint'
     - 'true'
+  deploySsmEndpoints: !Equals
+    - !Ref 'provisionSsmEndpoints'
+    - 'true'
+  deployEndpointSecurityGroup: !Or
+    - !Condition deployS3Endpoint
+    - !Condition deploySsmEndpoints
+  tagRouteTablesForFailover: !Not
+    - !Equals
+      - !Ref 'routeTableFailoverTag'
+      - ''
   az2: !Or
     - !Equals
       - !Ref numAzs
@@ -487,6 +497,24 @@ Parameters:
     Default: 'false'
     Description: Value of true provisions the VPC endpoints required for air-gapped / no-egress deployments - an S3 Gateway endpoint (Cloud Failover state storage, runtime-init artifacts) plus EC2, Secrets Manager, and CloudFormation Interface endpoints (Cloud Failover Extension API calls, secret retrieval, and the BIG-IP cfn-signal stack-success signal). Required when the BIG-IP dataplane has no internet egress (e.g. provisionPublicIpExternalSelf=false), or CFE initialization and the CloudFormation success signal will fail.
     Type: String
+  provisionSsmEndpoints:
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+    Description: Value of true provisions the ssm, ssmmessages and ec2messages Interface
+      endpoints that an instance needs to register with AWS Systems Manager and accept
+      Session Manager sessions when its subnet has no internet egress. Used by the air-gap
+      failover solution's private jump host (modules/ssm-jump).
+    Type: String
+  routeTableFailoverTag:
+    Default: ''
+    Description: When set, every route table created by this template is tagged
+      f5_cloud_failover_label=<value>. F5 Cloud Failover Extension discovers route tables
+      by that tag for route-based failover (failoverRoutes), and the BIG-IP instance
+      role's ec2:ReplaceRoute / ec2:CreateRoute permissions are conditioned on it. Leave
+      empty to create untagged route tables (EIP-based failover does not need it).
+    Type: String
   setPublicSubnet1:
     AllowedValues:
       - 'true'
@@ -620,10 +648,10 @@ Resources:
         - !If [naclPrivateC, !Ref privateRouteTableC, !Ref 'AWS::NoValue']
         - !If [naclPrivateD, !Ref privateRouteTableD, !Ref 'AWS::NoValue']
   vpcEndpointSecurityGroup:
-    Condition: deployS3Endpoint
+    Condition: deployEndpointSecurityGroup
     Type: 'AWS::EC2::SecurityGroup'
     Properties:
-      GroupDescription: 'HTTPS (443) to interface VPC endpoints (EC2, Secrets Manager) for air-gapped / no-egress BIG-IP API access'
+      GroupDescription: 'HTTPS (443) to interface VPC endpoints (EC2, Secrets Manager, CloudFormation, SSM) for air-gapped / no-egress API access'
       VpcId: !Ref vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -683,6 +711,53 @@ Resources:
     Properties:
       VpcEndpointType: Interface
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.cloudformation'
+      VpcId: !Ref vpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref vpcEndpointSecurityGroup
+      SubnetIds:
+        - !Ref subnet0A
+        - !If [az2, !Ref subnet0B, !Ref 'AWS::NoValue']
+        - !If [az3, !Ref subnet0C, !Ref 'AWS::NoValue']
+        - !If [az4, !Ref subnet0D, !Ref 'AWS::NoValue']
+  # Systems Manager endpoints: the three services the SSM Agent needs to register an
+  # instance and run Session Manager sessions without internet egress.
+  ssmVpcEndpoint:
+    Condition: deploySsmEndpoints
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref vpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref vpcEndpointSecurityGroup
+      SubnetIds:
+        - !Ref subnet0A
+        - !If [az2, !Ref subnet0B, !Ref 'AWS::NoValue']
+        - !If [az3, !Ref subnet0C, !Ref 'AWS::NoValue']
+        - !If [az4, !Ref subnet0D, !Ref 'AWS::NoValue']
+  ssmMessagesVpcEndpoint:
+    Condition: deploySsmEndpoints
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref vpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref vpcEndpointSecurityGroup
+      SubnetIds:
+        - !Ref subnet0A
+        - !If [az2, !Ref subnet0B, !Ref 'AWS::NoValue']
+        - !If [az3, !Ref subnet0C, !Ref 'AWS::NoValue']
+        - !If [az4, !Ref subnet0D, !Ref 'AWS::NoValue']
+  ec2MessagesVpcEndpoint:
+    Condition: deploySsmEndpoints
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
       VpcId: !Ref vpc
       PrivateDnsEnabled: true
       SecurityGroupIds:
@@ -3188,6 +3263,11 @@ Resources:
               - '-public-rt'
         - Key: Network
           Value: Public
+        - Fn::If:
+            - tagRouteTablesForFailover
+            - Key: f5_cloud_failover_label
+              Value: !Ref 'routeTableFailoverTag'
+            - !Ref 'AWS::NoValue'
         - Key: application
           Value: !Ref application
         - Key: costcenter
@@ -3241,6 +3321,11 @@ Resources:
               - '-private-rt-A'
         - Key: Network
           Value: Private
+        - Fn::If:
+            - tagRouteTablesForFailover
+            - Key: f5_cloud_failover_label
+              Value: !Ref 'routeTableFailoverTag'
+            - !Ref 'AWS::NoValue'
         - Key: application
           Value: !Ref application
         - Key: costcenter
@@ -3376,6 +3461,11 @@ Resources:
               - '-private-rt-B'
         - Key: Network
           Value: Private
+        - Fn::If:
+            - tagRouteTablesForFailover
+            - Key: f5_cloud_failover_label
+              Value: !Ref 'routeTableFailoverTag'
+            - !Ref 'AWS::NoValue'
         - Key: application
           Value: !Ref application
         - Key: costcenter
@@ -3511,6 +3601,11 @@ Resources:
               - '-private-rt-C'
         - Key: Network
           Value: Private
+        - Fn::If:
+            - tagRouteTablesForFailover
+            - Key: f5_cloud_failover_label
+              Value: !Ref 'routeTableFailoverTag'
+            - !Ref 'AWS::NoValue'
         - Key: application
           Value: !Ref application
         - Key: costcenter
@@ -3646,6 +3741,11 @@ Resources:
               - '-private-rt-D'
         - Key: Network
           Value: Private
+        - Fn::If:
+            - tagRouteTablesForFailover
+            - Key: f5_cloud_failover_label
+              Value: !Ref 'routeTableFailoverTag'
+            - !Ref 'AWS::NoValue'
         - Key: application
           Value: !Ref application
         - Key: costcenter
