@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Private jump host managed by AWS Systems Manager Session Manager. It has no public IP
+  address, no inbound security group rules and no SSH key; operators reach it through the
+  SSM API (ssm:StartSession) and port-forward through it to the BIG-IP management
+  interfaces. Requires the ssm, ssmmessages and ec2messages interface VPC endpoints when
+  the subnet has no internet egress (modules/network provisionSsmEndpoints=true).
+Conditions:
+  useCustomImage: !Not
+    - !Equals
+      - !Ref 'customImageId'
+      - ''
+  useVipCidr: !Not
+    - !Equals
+      - !Ref 'vipCidr'
+      - ''
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Placement
+        Parameters:
+          - vpc
+          - vpcCidr
+          - subnetId
+          - vipCidr
+      - Label:
+          default: Instance
+        Parameters:
+          - instanceType
+          - latestAmiId
+          - customImageId
+      - Label:
+          default: Resource Tags
+        Parameters:
+          - uniqueString
+          - application
+          - cost
+          - environment
+          - group
+          - owner
+    ParameterLabels:
+      application:
+        default: Application
+      cost:
+        default: Cost Center
+      customImageId:
+        default: Custom AMI ID (overrides the SSM public parameter lookup)
+      environment:
+        default: Environment
+      group:
+        default: Group
+      instanceType:
+        default: Instance type
+      latestAmiId:
+        default: SSM public parameter holding the Amazon Linux 2023 AMI ID
+      owner:
+        default: Owner
+      subnetId:
+        default: Private subnet for the jump host
+      uniqueString:
+        default: Unique string
+      vipCidr:
+        default: Application VIP prefix the jump host may reach (for testing)
+      vpc:
+        default: VPC ID
+      vpcCidr:
+        default: VPC CIDR
+Outputs:
+  stackName:
+    Description: SSM jump host nested stack name
+    Value: !Ref 'AWS::StackName'
+  ssmJumpInstanceId:
+    Description: Instance ID to pass to "aws ssm start-session --target"
+    Value: !Ref 'SsmJumpInstance'
+  ssmJumpPrivateIp:
+    Description: Private IP address of the jump host
+    Value: !GetAtt 'SsmJumpInstance.PrivateIp'
+  ssmJumpSecurityGroupId:
+    Description: Security group of the jump host (use as a source in other groups)
+    Value: !Ref 'SsmJumpSecurityGroup'
+  ssmJumpRoleArn:
+    Description: IAM role of the jump host
+    Value: !GetAtt 'SsmJumpRole.Arn'
+Parameters:
+  application:
+    Default: f5app
+    Description: Application Tag.
+    Type: String
+  cost:
+    Default: f5cost
+    Description: Cost Center Tag.
+    Type: String
+  customImageId:
+    Default: ''
+    Description: Optional AMI ID to use instead of the latestAmiId lookup. The image must
+      have the SSM Agent installed and starting at boot (Amazon Linux 2 / 2023 do).
+    Type: String
+  environment:
+    Default: f5env
+    Description: Environment Tag.
+    Type: String
+  group:
+    Default: f5group
+    Description: Group Tag.
+    Type: String
+  instanceType:
+    Default: t3.micro
+    Description: EC2 instance type. The host only terminates SSM sessions and forwards
+      ports, so the smallest available type is enough.
+    Type: String
+  latestAmiId:
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: SSM public parameter resolved at deploy time to the current Amazon Linux
+      2023 AMI for this Region. Amazon Linux ships the SSM Agent, so the host needs no
+      packages and no internet access to register with Systems Manager.
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+  owner:
+    Default: f5owner
+    Description: Owner Tag.
+    Type: String
+  subnetId:
+    Description: REQUIRED - A private subnet (no public IP on launch). The BIG-IP
+      management subnet is the natural choice.
+    Type: AWS::EC2::Subnet::Id
+  uniqueString:
+    AllowedPattern: ^[a-z][a-z0-9]{1,11}$
+    ConstraintDescription: Must contain between 1 and 12 lowercase alphanumeric characters
+      with first character as a letter.
+    Default: myuniqstr
+    Description: Unique String used when creating object names or Tags.
+    Type: String
+  vipCidr:
+    Default: ''
+    Description: Optional prefix the jump host is allowed to reach on 80/443, so that
+      "curl https://<vip>" from a Session Manager shell can verify the application VIP
+      before and after a failover. Leave empty to disallow.
+    Type: String
+  vpc:
+    Description: REQUIRED - VPC ID.
+    Type: AWS::EC2::VPC::Id
+  vpcCidr:
+    Description: REQUIRED - VPC CIDR. Outbound 443 to it reaches the SSM interface
+      endpoints; outbound 22/443 to it reaches the BIG-IP management interfaces.
+    Type: String
+Resources:
+  SsmJumpRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Tags:
+        - Key: application
+          Value: !Ref 'application'
+        - Key: costcenter
+          Value: !Ref 'cost'
+        - Key: environment
+          Value: !Ref 'environment'
+        - Key: group
+          Value: !Ref 'group'
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'uniqueString'
+              - '-ssm-jump-role'
+        - Key: owner
+          Value: !Ref 'owner'
+  SsmJumpInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref 'SsmJumpRole'
+  SsmJumpSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref 'vpc'
+      GroupDescription: SSM jump host - no inbound; outbound only to the VPC (SSM endpoints,
+        BIG-IP management) and optionally the application VIP prefix
+      GroupName: !Join
+        - ''
+        - - !Ref 'uniqueString'
+          - '-ssm-jump-sg'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref 'vpcCidr'
+          Description: SSM interface endpoints and BIG-IP management GUI / REST
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref 'vpcCidr'
+          Description: BIG-IP management SSH
+        - !If
+          - useVipCidr
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: !Ref 'vipCidr'
+            Description: Application VIP (HTTP) for verification
+          - !Ref 'AWS::NoValue'
+        - !If
+          - useVipCidr
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: !Ref 'vipCidr'
+            Description: Application VIP (HTTPS) for verification
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: application
+          Value: !Ref 'application'
+        - Key: costcenter
+          Value: !Ref 'cost'
+        - Key: environment
+          Value: !Ref 'environment'
+        - Key: group
+          Value: !Ref 'group'
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'uniqueString'
+              - '-ssm-jump-sg'
+        - Key: owner
+          Value: !Ref 'owner'
+  SsmJumpLaunchTemplate:
+    # A launch template is the only way to require IMDSv2 on an AWS::EC2::Instance.
+    Type: 'AWS::EC2::LaunchTemplate'
+    Properties:
+      LaunchTemplateName: !Join
+        - ''
+        - - !Ref 'uniqueString'
+          - '-ssm-jump-lt'
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+  SsmJumpInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: !If
+        - useCustomImage
+        - !Ref 'customImageId'
+        - !Ref 'latestAmiId'
+      InstanceType: !Ref 'instanceType'
+      IamInstanceProfile: !Ref 'SsmJumpInstanceProfile'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref 'SsmJumpLaunchTemplate'
+        Version: !GetAtt 'SsmJumpLaunchTemplate.LatestVersionNumber'
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeviceIndex: '0'
+          SubnetId: !Ref 'subnetId'
+          GroupSet:
+            - !Ref 'SsmJumpSecurityGroup'
+      UserData: !Base64
+        'Fn::Join':
+          - ''
+          - - |
+              #!/bin/bash
+            - |
+              echo '***** SSM jump host - reach BIG-IP management with: aws ssm start-session --document-name AWS-StartPortForwardingSessionToRemoteHost *****' > /etc/motd
+            - |
+              systemctl enable --now amazon-ssm-agent || true
+      Tags:
+        - Key: application
+          Value: !Ref 'application'
+        - Key: costcenter
+          Value: !Ref 'cost'
+        - Key: environment
+          Value: !Ref 'environment'
+        - Key: group
+          Value: !Ref 'group'
+        - Key: Name
+          Value: !Join
+            - ''
+            - - !Ref 'uniqueString'
+              - '-ssm-jump-vm'
+        - Key: owner
+          Value: !Ref 'owner'

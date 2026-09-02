@@ -1,0 +1,182 @@
+[
+  {
+    "ParameterKey": "allowUsageAnalytics",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "appDockerImageName",
+    "ParameterValue": "f5devcentral/f5-demo-app:latest"
+  },
+  {
+    "ParameterKey": "application",
+    "ParameterValue": "f5app"
+  },
+  {
+    "ParameterKey": "artifactLocation",
+    "ParameterValue": "f5-aws-cloudformation-v2/v3.6.0.0/examples/"
+  },
+  {
+    "ParameterKey": "bigIpCustomImageId",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "bigIpExternalSelfIp01",
+    "ParameterValue": "10.0.0.11"
+  },
+  {
+    "ParameterKey": "bigIpExternalSelfIp02",
+    "ParameterValue": "10.0.4.11"
+  },
+  {
+    "ParameterKey": "bigIpHostname01",
+    "ParameterValue": "failover01.local"
+  },
+  {
+    "ParameterKey": "bigIpHostname02",
+    "ParameterValue": "failover02.local"
+  },
+  {
+    "ParameterKey": "bigIpImage",
+    "ParameterValue": "*17.5.1.6-0.0.25*PAYG-Best Plus 25Mbps*"
+  },
+  {
+    "ParameterKey": "bigIpInstanceProfile",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "bigIpInstanceType",
+    "ParameterValue": "m5.xlarge"
+  },
+  {
+    "ParameterKey": "bigIpInternalSelfIp01",
+    "ParameterValue": "10.0.2.11"
+  },
+  {
+    "ParameterKey": "bigIpInternalSelfIp02",
+    "ParameterValue": "10.0.6.11"
+  },
+  {
+    "ParameterKey": "bigIpLicenseKey01",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "bigIpLicenseKey02",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "bigIpMgmtAddress01",
+    "ParameterValue": "10.0.1.11"
+  },
+  {
+    "ParameterKey": "bigIpMgmtAddress02",
+    "ParameterValue": "10.0.5.11"
+  },
+  {
+    "ParameterKey": "bigIpPeerAddr",
+    "ParameterValue": "10.0.1.11"
+  },
+  {
+    "ParameterKey": "bigIpRuntimeInitConfig01",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "bigIpRuntimeInitConfig02",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "bigIpRuntimeInitPackageUrl",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "bigIpSecretArn",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "cfeS3Bucket",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "cfeTag",
+    "ParameterValue": "bigip_high_availability_solution"
+  },
+  {
+    "ParameterKey": "cost",
+    "ParameterValue": "f5cost"
+  },
+  {
+    "ParameterKey": "environment",
+    "ParameterValue": "f5env"
+  },
+  {
+    "ParameterKey": "externalVipAddress",
+    "ParameterValue": "10.99.0.100"
+  },
+  {
+    "ParameterKey": "externalVipCidr",
+    "ParameterValue": "10.99.0.0/24"
+  },
+  {
+    "ParameterKey": "group",
+    "ParameterValue": "f5group"
+  },
+  {
+    "ParameterKey": "numAzs",
+    "ParameterValue": "2"
+  },
+  {
+    "ParameterKey": "numNics",
+    "ParameterValue": "3"
+  },
+  {
+    "ParameterKey": "numSubnets",
+    "ParameterValue": "4"
+  },
+  {
+    "ParameterKey": "owner",
+    "ParameterValue": "f5owner"
+  },
+  {
+    "ParameterKey": "provisionBastion",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "provisionExampleApp",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "provisionSsmAccess",
+    "ParameterValue": "true"
+  },
+  {
+    "ParameterKey": "restrictedSrcAddressApp",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "restrictedSrcAddressMgmt",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "s3BucketName",
+    "ParameterValue": "f5-cft-gov"
+  },
+  {
+    "ParameterKey": "s3BucketRegion",
+    "ParameterValue": "us-gov-east-1"
+  },
+  {
+    "ParameterKey": "sshKey",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "subnetMask",
+    "ParameterValue": "24"
+  },
+  {
+    "ParameterKey": "uniqueString",
+    "ParameterValue": "myuniqstr"
+  },
+  {
+    "ParameterKey": "vpcCidr",
+    "ParameterValue": "10.0.0.0/16"
+  }
+]
