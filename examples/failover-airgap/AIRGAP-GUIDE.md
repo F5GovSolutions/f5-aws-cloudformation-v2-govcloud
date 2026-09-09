@@ -1,249 +1,1433 @@
-# Air-gap failover in AWS GovCloud - route-based VIP guide
+# Air-gap BIG-IP failover in AWS GovCloud — deployment guide
 
-This is the companion to [`examples/failover/GOVCLOUD-GUIDE.md`](../failover/GOVCLOUD-GUIDE.md).
-Everything about staging the bucket, the admin secret, the key pair, the image lookup and the
-clustering self-heal applies unchanged. This guide covers only what this template does
-differently: **no public addresses, and a VIP that fails over across Availability Zones
-by route rather than by Elastic IP.**
+A complete, first-time-operator walkthrough for deploying an active/standby BIG-IP pair
+into AWS GovCloud with **no public IP addresses anywhere**, and an application VIP that
+fails over between Availability Zones **without an Elastic IP**.
 
-> ### ⚠️ Not yet lab-validated
-> The templates lint clean and the CFE declaration follows F5's documented schema and
-> examples, but this path has **not** been run end to end in GovCloud yet. Section 5 is the
-> validation procedure. Run it in both failover directions and record the measured
-> convergence time before this design goes in front of a customer.
+**This guide is self-contained.** Everything needed to deploy, reach, validate and
+troubleshoot the solution is here — you should not need to open another document to get a
+working stack. [`examples/failover/GOVCLOUD-GUIDE.md`](../failover/GOVCLOUD-GUIDE.md)
+covers the *other* solution in this repository, the EIP-based failover pair; read it only
+if you are deploying that instead, or want more background on GovCloud generally.
 
-## 1. Why the EIP-based template cannot do this
+> ### ✅ Lab-validated
+> Deployed and failover-tested end to end in `us-gov-east-1` on **2026-09-08**, on the
+> 3-NIC PAYG BIG-IP 17.5.1.6 pair. VIP failover was verified in **both** directions across
+> several runs and converged in **6-10 seconds**. Quote **10 seconds** to a customer for
+> headroom. See [section 8](#8-testing-failover) for the method and the raw numbers.
 
-The `examples/failover` solution puts each BIG-IP in its own Availability Zone, so its own
-external subnet. Its VIP is a **secondary private IP** on each device's external ENI:
+---
+
+## Contents
+
+1. [What you are deploying](#1-what-you-are-deploying)
+2. [How the VIP fails over](#2-how-the-vip-fails-over)
+3. [Before you start](#3-before-you-start)
+4. [Step-by-step deployment](#4-step-by-step-deployment)
+5. [Getting into the BIG-IPs with Session Manager](#5-getting-into-the-big-ips-with-session-manager)
+6. [Validating the deployment](#6-validating-the-deployment)
+7. [Seeing it work in a browser](#7-seeing-it-work-in-a-browser)
+8. [Testing failover](#8-testing-failover)
+9. [What to plan for](#9-what-to-plan-for)
+10. [Tearing the stack down](#10-tearing-the-stack-down)
+11. [Troubleshooting](#11-troubleshooting)
+
+---
+
+## 1. What you are deploying
+
+Two BIG-IP Virtual Editions in an active/standby pair, one in each of two Availability
+Zones, plus a small jump host for management access. Nothing in the VPC has a public IP
+address, and every AWS API call the BIG-IPs make is served by a VPC endpoint inside the
+VPC rather than over the internet.
+
+```mermaid
+flowchart TB
+    OP["👤 <b>Operator workstation</b><br/>AWS CLI + Session Manager plugin<br/><i>outside the VPC</i>"]
+    SSMAPI["<b>AWS Systems Manager API</b><br/><i>control plane · IAM authorised</i>"]
+    OP -->|"aws ssm start-session"| SSMAPI
+
+    subgraph VPC["VPC 10.0.0.0/16 · no internet path for the BIG-IPs"]
+        direction TB
+
+        CLIENT["<b>Client in the VPC</b>"]
+        RT["🧭 <b>Route tables ×3</b><br/>tagged f5_cloud_failover_label<br/>10.99.0.0/24 → ENI of the ACTIVE device"]
+        JUMP["🖥️ <b>SSM jump host</b><br/>no public IP · no inbound rules · no SSH key"]
+
+        subgraph AZA["Availability Zone A"]
+            BIP1["<b>BIG-IP failover01 — ACTIVE</b><br/>external eth1 · 10.0.0.11 · src/dst check OFF<br/>mgmt eth0 · 10.0.1.11"]
+        end
+
+        subgraph AZB["Availability Zone B"]
+            BIP2["<b>BIG-IP failover02 — STANDBY</b><br/>external eth1 · 10.0.4.11 · src/dst check OFF<br/>mgmt eth0 · 10.0.5.11"]
+        end
+
+        EPS["<b>VPC endpoints</b><br/>S3 · EC2 · Secrets Manager · CloudFormation<br/>SSM · SSM Messages · EC2 Messages"]
+
+        CLIENT -->|"https://10.99.0.100"| RT
+        RT ==>|"<b>currently</b>"| BIP1
+        RT -.->|"after failover"| BIP2
+        JUMP -->|"port-forward 443 / 22"| BIP1
+        JUMP -->|"port-forward 443 / 22"| BIP2
+        BIP1 -.->|"AWS API calls"| EPS
+        BIP2 -.->|"AWS API calls"| EPS
+    end
+
+    SSMAPI -.->|"agent connects outbound<br/>via the SSM endpoints"| JUMP
+
+    classDef active fill:#e6f4ea,stroke:#137333,stroke-width:2px,color:#0d652d
+    classDef standby fill:#f1f3f4,stroke:#80868b,color:#3c4043
+    classDef vip fill:#fce8e6,stroke:#c5221f,stroke-width:2px,color:#a50e0e
+    classDef ext fill:#e8f0fe,stroke:#1967d2,color:#174ea6
+    class BIP1 active
+    class BIP2 standby
+    class RT vip
+    class OP,SSMAPI ext
+```
+
+**What makes the air gap real.** The private subnets have **no default route** — no NAT
+gateway, no Elastic IP, no path to the internet at all. Everything the solution needs is
+reachable without one:
+
+| Dependency | How it is served with no egress |
+|---|---|
+| Templates, runtime-init installer, extension RPMs, WAF policy | **S3 gateway endpoint**, attached to the private route tables |
+| EC2, Secrets Manager, CloudFormation, Systems Manager APIs | **Interface endpoints** with private DNS |
+| DNS | **`169.254.169.253`** — the link-local VPC resolver |
+| NTP | **`169.254.169.123`** — Amazon Time Sync, link-local |
+
+> ⚠️ **Anything you add that expects internet egress will fail**, including
+> `provisionExampleApp='true'`, which pulls a container image. If you need egress, set
+> `provisionNatGateways` back to `true` in the `Network` stack parameters — and accept that
+> it reintroduces two Elastic IPs and a route out of the BIG-IP management and internal
+> subnets, which an assessor will find.
+
+**The moving pieces:**
+
+| Piece | What it is | Why it is here |
+|---|---|---|
+| **BIG-IP pair** | Two VEs, 3 NICs each (management, external, internal), clustered active/standby | The HA pair serving your application |
+| **Application VIP** `10.99.0.100` | An address **outside the VPC CIDR** | It belongs to no subnet, so it can be routed to either AZ — this is the whole trick |
+| **Route tables** | Three, each with a route for `10.99.0.0/24` and tagged `f5_cloud_failover_label` | How clients reach the VIP, and what moves on failover |
+| **Cloud Failover Extension (CFE)** | An F5 extension running on each BIG-IP | On failover it calls `ec2:ReplaceRoute` to re-point those routes |
+| **Declarative Onboarding (DO)** | F5 extension | Builds the cluster, VLANs and Self IPs at first boot |
+| **Application Services (AS3)** | F5 extension | Creates the virtual server bound to the VIP |
+| **BIG-IP Runtime Init** | F5 bootstrapper | Downloads and applies DO/AS3/CFE from your S3 bucket at boot |
+| **SSM jump host** | Amazon Linux 2023, `t3.micro` | The only way in. BIG-IP cannot run the SSM Agent, so this hop exists |
+| **VPC endpoints** | S3, EC2, Secrets Manager, CloudFormation, SSM ×3 | Let the BIG-IPs and jump host reach AWS APIs with no internet |
+
+---
+
+## 2. How the VIP fails over
+
+### Why the standard template cannot do this
+
+In the EIP-based [`examples/failover`](../failover/README.md) solution, each BIG-IP is in
+its own AZ, so its own subnet. The VIP is a **secondary private IP** on each device's
+external interface:
 
 | BIG-IP | AZ | External subnet | Self IP | VIP (secondary) |
 |---|---|---|---|---|
-| failover01 | AZ a | `10.0.0.0/24` | `10.0.0.11` | `10.0.0.101` |
-| failover02 | AZ b | `10.0.4.0/24` | `10.0.4.11` | `10.0.4.101` |
+| failover01 | A | `10.0.0.0/24` | `10.0.0.11` | `10.0.0.101` |
+| failover02 | B | `10.0.4.0/24` | `10.0.4.11` | `10.0.4.101` |
 
-A secondary private IP belongs to its subnet's CIDR. AWS will not assign `10.0.0.101` to an
-ENI in `10.0.4.0/24`, so the two VIPs are two independent addresses, and the only thing CFE
-can move between them is an **Elastic IP association**. Take the EIP away, as an air-gap
-deployment must, and CFE has nothing to relocate. The stack deploys, the cluster forms,
-`cloud-failover/inspect` looks healthy, and the VIP never moves. That is what this template
-fixes.
+A secondary private IP must belong to its subnet's CIDR. AWS will not assign `10.0.0.101`
+to an interface in `10.0.4.0/24`, so those are two independent addresses and the only
+thing CFE can move between them is an **Elastic IP association**.
 
-## 2. How route-based failover works here
+Remove the Elastic IP — as an air-gapped deployment must — and CFE has nothing to
+relocate. The stack deploys, the cluster forms, `cloud-failover/inspect` looks healthy,
+and **the VIP silently never moves**. That is the problem this template solves.
 
-The VIP is an address **outside the VPC CIDR**, `externalVipAddress` (default
-`10.99.0.100`), inside a prefix `externalVipCidr` (default `10.99.0.0/24`). Because the
-prefix is not part of the VPC, AWS has no implicit route for it, so the template creates
-one in every route table:
+### What this template does instead
 
+The VIP is an address outside the VPC CIDR, so AWS has no implicit route for it. The
+template creates one in every route table, pointing at the active BIG-IP's external
+interface. On failover, CFE re-points them.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client in VPC
+    participant RT as Route tables (×3)
+    participant A as failover01
+    participant B as failover02
+    participant EC2 as EC2 API<br/>(via VPC endpoint)
+
+    Note over A,B: failover01 ACTIVE · failover02 STANDBY
+    C->>RT: packet to 10.99.0.100
+    RT->>A: 10.99.0.0/24 → eni of failover01
+    A-->>C: response
+
+    Note over A,B: 💥 failover — "tmsh run sys failover standby",<br/>or A fails / loses heartbeat
+    A->>B: traffic-group-1 moves to failover02
+    B->>B: CFE detects it became ACTIVE
+    B->>B: pick own next hop from the static list<br/>(matches its own Self IP 10.0.4.11)
+    B->>EC2: ec2:ReplaceRoute ×3<br/>10.99.0.0/24 → eni of failover02
+    EC2-->>RT: routes updated
+    C->>RT: packet to 10.99.0.100
+    RT->>B: 10.99.0.0/24 → eni of failover02
+    B-->>C: response
+
+    Note over C,B: measured: 6-10 seconds end to end
 ```
-Route table (tagged f5_cloud_failover_label = cfeTag)
-  Destination        Target
-  10.99.0.0/24    →  eni-…  (failover01's external ENI, initially)
-```
 
-A client anywhere in the VPC sends to `10.99.0.100`; its subnet's route table sends the
-packet to the active BIG-IP's external ENI; the BIG-IP answers because AS3 has bound a
-virtual server to that address. On failover, CFE calls `ec2:ReplaceRoute` in each tagged
-route table and points the prefix at the peer's ENI. One API call per table, no addressing
-changes anywhere.
+The client never changes the address it is talking to. No addressing changes anywhere —
+just three API calls.
 
-Five things have to line up for that to work, and the template does all five:
+### Five things must line up
 
-| Requirement | Where it is done |
-|---|---|
-| Route for the prefix in every route table clients use | `VipRoutePublic`, `VipRoutePrivateA`, `VipRoutePrivateB` in `failover-airgap.yaml` |
-| Route tables tagged so CFE can find them **and** IAM lets CFE change them | `modules/network` parameter `routeTableFailoverTag` (set to `cfeTag`) |
-| Source/destination checking **off** on both external ENIs, or AWS drops the traffic before BIG-IP sees it | `modules/bigip-standalone` parameter `disableSourceDestCheck` |
-| `failoverRoutes` in the CFE declaration, with both external Self IPs as next hops | `bigip-configurations/runtime-init-conf-*-airgap.yaml`, values from instance tags |
-| AS3 virtual server on the VIP address | same files, `Service_Address_01` |
+The template does all five for you; they are listed so you know what to check if
+something is wrong.
 
-The instance role already has what CFE needs. `solutionType: failover` provisions
-`BigIpHighAvailabilityAccessRole`, which grants `ec2:ReplaceRoute`, `ec2:CreateRoute` and
-`ec2:DescribeRouteTables`; the write actions are conditioned on the route table carrying
-`f5_cloud_failover_label` = `cfeTag`, which the network tag satisfies.
+| # | Requirement | Where it happens |
+|---|---|---|
+| 1 | A route for the VIP prefix in every route table clients use | `VipRoutePublic`, `VipRoutePrivateA`, `VipRoutePrivateB` in `failover-airgap.yaml` |
+| 2 | Route tables tagged so CFE can **find** them and IAM **allows** the write | `modules/network` parameter `routeTableFailoverTag` (set to `cfeTag`) |
+| 3 | Source/destination checking **off** on both external interfaces | `modules/bigip-standalone` parameter `disableSourceDestCheck` |
+| 4 | `failoverRoutes` in the CFE declaration, with **bare** Self IPs as next hops | `bigip-configurations/runtime-init-conf-*-airgap.yaml` |
+| 5 | An AS3 virtual server bound to the VIP address | same files, `Service_Address_01` |
 
-## 3. Choosing the parameters
+> **Why "source/destination check off" matters.** AWS normally drops any packet arriving
+> at an interface that is not addressed to that interface. The VIP is not one of the
+> BIG-IP's own addresses, so without this the traffic is discarded before BIG-IP ever
+> sees it. The template disables it on the interface resource itself, so it survives
+> reboots.
 
-**`externalVipCidr` and `externalVipAddress`.** Pick a prefix that collides with nothing
-reachable from the VPC: not the VPC CIDR, not peered VPCs, not on-premises ranges arriving
-over Direct Connect, VPN or Transit Gateway. The address must be inside the prefix. The
-same prefix is used for the route and for CFE's `scopingAddressRanges`; CFE's prefix
-matching is exact, so do not try to route a `/32` and scope a `/24`.
+> **Why "bare" Self IPs matters.** CFE matches the next-hop list against each device's own
+> addresses to decide which hop is its own. An entry with a mask (`10.0.0.11/24`) never
+> matches a bare address (`10.0.0.11`), and the device that fails to match performs **zero**
+> route operations while still reporting success. This was a real bug, found in lab on
+> 2026-09-08 and fixed; see [troubleshooting](#failover-succeeds-but-the-route-never-moves).
 
-**`provisionSsmAccess` (default `true`).** The BIG-IP management interfaces have no public
-address, so you need a way in. The default deploys a small Amazon Linux jump host in the
-BIG-IP management subnet, registered with AWS Systems Manager through the `ssm`,
-`ssmmessages` and `ec2messages` interface endpoints. It has **no public IP, no inbound
-security group rule and no SSH key** - the only way onto it is `aws ssm start-session`,
-which is authorised by IAM and logged in CloudTrail. From your workstation you
-port-forward *through* it to a BIG-IP management address (section 4a). BIG-IP itself
-cannot run the SSM Agent, which is why the hop exists.
+---
 
-**`provisionBastion` (default `false`).** The fallback for environments where Systems
-Manager is not permitted: the repository's Linux bastion in the first external subnet
-**with a public IP** and SSH open to `restrictedSrcAddressMgmt`. That is a public address
-and an open port inside an air-gap design, and it is the first thing an assessor will find.
-Use it deliberately or not at all. With both set to `false`, nothing in the VPC has a
-public address and management must arrive over private connectivity.
+## 3. Before you start
 
-**Everything else** is as in the GovCloud guide's parameter reference. The public-IP
-toggles are gone because they have exactly one valid value here.
+### 3.1 On the AWS side
 
-## 4. Deploy
+- **An AWS GovCloud account** with permission to create VPCs, EC2 instances, IAM roles
+  (`CAPABILITY_NAMED_IAM`), S3 buckets, Secrets Manager secrets and VPC endpoints.
+- **One Region, used consistently.** Pick `us-gov-east-1` or `us-gov-west-1` and use it
+  for the stack, the S3 bucket, the key pair and the secret. VPC endpoints are regional —
+  an endpoint in one Region cannot reach a bucket in another, so a cross-Region setup
+  breaks the air gap even if it appears to work.
+- **A subscription to the BIG-IP marketplace image** for your Region.
+- **A staging S3 bucket** holding the templates and BIG-IP artifacts (step 4.4).
 
-Stage the bucket as in the GovCloud guide, including this directory, then create the stack
-with `failover-airgap-parameters.json` (fill in the bucket, key, secret and source-address
-values first). The BIG-IPs fetch their runtime-init configs from
-`<artifactLocation>failover-airgap/bigip-configurations/` by default.
+### 3.2 On your workstation
 
-After `CREATE_COMPLETE`, the outputs tell you what to look at: `vipAddress`,
-`vipRouteTableIds`, `bigIpExternalInterfaceId01/02`, `ssmJumpInstanceId`, and two
-ready-to-paste port-forwarding commands, `ssmPortForwardBigIp01` and `ssmPortForwardBigIp02`.
+- **A clone of this repository.** You run `aws s3 sync` from its root.
+- **The AWS CLI v2**, configured for your GovCloud account.
+- **Python 3** — used only to pretty-print JSON in the verification commands.
+- **The AWS Session Manager plugin.** This is a *separate install* from the AWS CLI and is
+  the single most commonly missed prerequisite. Without it, `aws ssm start-session` fails
+  with `SessionManagerPlugin is not found` and you cannot reach the BIG-IPs at all.
 
-### 4a. Reaching the BIG-IPs through Session Manager
+<details>
+<summary><b>Installing the Session Manager plugin</b> (click to expand)</summary>
 
-Prerequisites on your workstation: the AWS CLI, the
-[Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html),
-and an identity allowed `ssm:StartSession` on the jump instance and on the
-`AWS-StartPortForwardingSessionToRemoteHost` document.
+**macOS — with Homebrew (easiest):**
 
 ```bash
-REGION=us-gov-west-1
-JUMP=$(aws cloudformation describe-stacks --region "$REGION" --stack-name failover-airgap \
+brew install --cask session-manager-plugin
+```
+
+**macOS — official installer.** Check your chip first with `uname -m`:
+
+```bash
+cd /tmp
+# Apple Silicon (arm64)
+curl -o sessionmanager-bundle.zip \
+  "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/sessionmanager-bundle.zip"
+# Intel (x86_64) — use this URL instead
+# curl -o sessionmanager-bundle.zip \
+#   "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac/sessionmanager-bundle.zip"
+
+unzip -o sessionmanager-bundle.zip
+sudo ./sessionmanager-bundle/install \
+  -i /usr/local/sessionmanagerplugin -b /usr/local/bin/session-manager-plugin
+```
+
+**Linux (RPM):**
+
+```bash
+curl -o session-manager-plugin.rpm \
+  "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm"
+sudo yum install -y session-manager-plugin.rpm
+```
+
+**Linux (Debian/Ubuntu):**
+
+```bash
+curl -o session-manager-plugin.deb \
+  "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb"
+sudo dpkg -i session-manager-plugin.deb
+```
+
+**Windows:** download and run the installer from
+[AWS's documentation](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
+
+**Verify — on any platform:**
+
+```bash
+hash -r          # zsh/bash cache command paths; this makes the shell notice the new binary
+session-manager-plugin
+# → "The Session Manager plugin was installed successfully. Use the AWS CLI to start a session."
+```
+
+</details>
+
+- **IAM permission to start sessions.** Your identity needs `ssm:StartSession` on the jump
+  instance and on the `AWS-StartPortForwardingSessionToRemoteHost` document.
+- **Reachability of the AWS API.** Session Manager works by your workstation talking to the
+  AWS *control plane*, not to the VPC. If you can run `aws cloudformation describe-stacks`,
+  you are fine. In a fully disconnected enclave with no AWS API access at all, Session
+  Manager cannot help and you would need private connectivity (Direct Connect/VPN) instead.
+
+### 3.3 Choosing your VIP prefix
+
+`externalVipCidr` (default `10.99.0.0/24`) and `externalVipAddress` (default
+`10.99.0.100`) need thought before you deploy:
+
+- The prefix **must not overlap** the VPC CIDR, any peered VPC, or any on-premises range
+  reachable over Direct Connect, VPN or Transit Gateway. It is routed *inside* this VPC,
+  so a collision black-holes real traffic.
+- The address must be **inside** the prefix.
+- The **same prefix** is used for the route and for CFE's scoping range. CFE's prefix
+  matching is exact — do not route a `/32` and scope a `/24`.
+
+---
+
+## 4. Step-by-step deployment
+
+### 4.1 Set your variables
+
+Everything below uses these. Set them once per terminal session.
+
+```bash
+REGION=us-gov-east-1
+BUCKET=f5-cft-gov                                   # must be globally unique
+PREFIX=f5-aws-cloudformation-v2/v3.6.0.0/examples
+STACK=failover-airgap
+```
+
+> **zsh users:** zsh does not word-split unquoted variables the way bash does. Where a
+> command below takes a *list* (several route table IDs, for example), the IDs are written
+> out literally rather than passed through one variable. If you build your own, use a zsh
+> array — `RTBS=(rtb-aaa rtb-bbb)` — not `RTBS="rtb-aaa rtb-bbb"`.
+
+### 4.2 Create the admin password secret
+
+The BIG-IPs read their admin password from AWS Secrets Manager at boot. Both devices use
+the **same** secret — that shared credential is also what lets them establish device trust
+with each other.
+
+```bash
+aws secretsmanager create-secret --region "$REGION" \
+  --name f5-bigip-admin-password \
+  --secret-string 'CHANGE-ME-to-a-strong-password'
+
+# Note the ARN it returns — you need it in step 4.6
+aws secretsmanager list-secrets --region "$REGION" \
+  --query 'SecretList[].[Name,ARN]' --output table
+```
+
+### 4.3 Create an SSH key pair
+
+```bash
+aws ec2 create-key-pair --region "$REGION" --key-name f5-airgap-key \
+  --query 'KeyMaterial' --output text > ~/.ssh/f5-airgap-key.pem
+chmod 400 ~/.ssh/f5-airgap-key.pem
+```
+
+You pass the key pair **name** (`f5-airgap-key`), not the file path.
+
+### 4.4 Stage the S3 bucket
+
+The BIG-IPs and CloudFormation both read everything from this bucket. There are two kinds
+of object, and they get there differently:
+
+- **Templates** (`modules/**`, `failover-airgap/**`) — copied by `aws s3 sync` from this repo.
+- **BIG-IP artifacts** — the runtime-init installer and three extension RPMs. These are
+  **not in the repo** and `s3 sync` will not copy them. Download and `cp` them separately.
+
+**Download the artifacts** (once, from a machine with internet):
+
+```bash
+curl -fL -o f5-bigip-runtime-init-2.0.3-1.gz.run \
+  https://github.com/F5Networks/f5-bigip-runtime-init/releases/download/2.0.3/f5-bigip-runtime-init-2.0.3-1.gz.run
+curl -fL -o f5-declarative-onboarding-1.47.0-14.noarch.rpm \
+  https://github.com/F5Networks/f5-declarative-onboarding/releases/download/v1.47.0/f5-declarative-onboarding-1.47.0-14.noarch.rpm
+curl -fL -o f5-appsvcs-3.56.0-10.noarch.rpm \
+  https://github.com/F5Networks/f5-appsvcs-extension/releases/download/v3.56.0/f5-appsvcs-3.56.0-10.noarch.rpm
+curl -fL -o f5-cloud-failover-2.4.0-0.noarch.rpm \
+  https://github.com/F5Networks/f5-cloud-failover-extension/releases/download/v2.4.0/f5-cloud-failover-2.4.0-0.noarch.rpm
+```
+
+> The RPM versions above match the `extensionHash` values pinned in the runtime-init
+> config files, which the BIG-IP enforces at install time. If you change a version, update
+> its `extensionVersion` and `extensionHash` too.
+
+**Create the bucket and upload** (run `s3 sync` from the repository root):
+
+```bash
+aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+  --create-bucket-configuration LocationConstraint="$REGION"
+
+aws s3 sync ./examples/ "s3://$BUCKET/$PREFIX/" --region "$REGION"
+
+aws s3 cp f5-bigip-runtime-init-2.0.3-1.gz.run           "s3://$BUCKET/$PREFIX/" --region "$REGION"
+aws s3 cp f5-declarative-onboarding-1.47.0-14.noarch.rpm "s3://$BUCKET/$PREFIX/bigip-extensions/" --region "$REGION"
+aws s3 cp f5-appsvcs-3.56.0-10.noarch.rpm                "s3://$BUCKET/$PREFIX/bigip-extensions/" --region "$REGION"
+aws s3 cp f5-cloud-failover-2.4.0-0.noarch.rpm           "s3://$BUCKET/$PREFIX/bigip-extensions/" --region "$REGION"
+```
+
+> ⚠️ **Never add `--delete` to that sync.** The installer and RPMs live only in the bucket,
+> not in the repo, so `--delete` would remove them and every BIG-IP would fail to onboard.
+
+**If you are updating an existing bucket**, the same `s3 sync` is all you need — it is
+idempotent and uploads only what changed. Re-run it after *any* local edit to a template
+or runtime-init file: the BIG-IPs read the bucket copy, not your working tree. A stale
+bucket is the single most confusing failure mode, because the stack deploys perfectly and
+the BIG-IPs quietly use the old configuration.
+
+### 4.5 Make the artifacts readable (required)
+
+CloudFormation fetches the nested *templates* using your IAM credentials, so a private
+bucket is fine for those. But each **BIG-IP downloads the installer, its runtime-init
+config and the RPMs at boot using unauthenticated HTTPS** — no AWS signature. If those
+objects are not anonymously readable the BIG-IP gets HTTP 403, runtime-init never
+installs, nothing is configured, and the stack rolls back, often with no obvious error.
+
+GovCloud enables Block Public Access and disables ACLs by default, so you grant read with
+a bucket policy. Clearing Block Public Access alone grants nothing.
+
+```bash
+aws s3api put-public-access-block --bucket "$BUCKET" \
+  --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false
+
+cat > /tmp/bucket-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublicReadGetObject",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws-us-gov:s3:::${BUCKET}/*"
+    },
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws-us-gov:s3:::${BUCKET}",
+        "arn:aws-us-gov:s3:::${BUCKET}/*"
+      ],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    }
+  ]
+}
+EOF
+
+aws s3api put-bucket-policy --bucket "$BUCKET" --policy file:///tmp/bucket-policy.json
+```
+
+Grant `s3:GetObject` only — never `PutObject` or `DeleteObject` to `Principal: "*"`.
+`s3:ListBucket` is deliberately omitted so the bucket cannot be enumerated. If you know
+your consumer account IDs, scope `Principal` to those instead of `"*"`.
+
+<details>
+<summary><b>If your security posture forbids any public-read bucket</b> (click to expand)</summary>
+
+First, one trap worth stating plainly: **an S3 gateway endpoint alone does not fix the
+403.** The default bootstrap sends an *unsigned* request, which a private bucket rejects
+regardless of the endpoint. The endpoint only helps once the request is IAM-signed.
+
+Three options, all of which avoid public exposure:
+
+- **A — IAM-signed pulls (bucket stays private).** Scope the bucket policy to the BIG-IP
+  instance role, leave Block Public Access on, keep the S3 gateway endpoint, and have the
+  bootstrap fetch artifacts with signed requests. Fully in-partition and no public exposure,
+  but it requires customising how runtime-init fetches its artifacts.
+- **B — pre-signed URLs.** Pass pre-signed S3 URLs via `bigIpRuntimeInitPackageUrl`,
+  `bigIpRuntimeInitConfig01` / `02`, and the RPM `extensionUrl` values in the runtime-init
+  configs. Simple, but the URLs expire, so it suits one-off builds rather than a pattern you
+  redeploy.
+- **C — custom image.** Bake the artifacts into a custom BIG-IP image with the
+  [F5 Image Generation Tool](https://clouddocs.f5.com/cloud/public/v1/ve-image-gen_index.html).
+  Most work up front, least at deploy time, and nothing is fetched at boot at all.
+
+Public-read of a bucket containing only F5 installation artifacts is the simplest option and
+is what this guide documents. The three above are the alternatives when that is not
+acceptable.
+
+</details>
+
+**Verify every object the BIG-IP needs. All must return `200`:**
+
+```bash
+for KEY in \
+  "${PREFIX}/failover-airgap/failover-airgap.yaml" \
+  "${PREFIX}/failover-airgap/bigip-configurations/runtime-init-conf-3nic-payg-instance01-airgap.yaml" \
+  "${PREFIX}/failover-airgap/bigip-configurations/runtime-init-conf-3nic-payg-instance02-airgap.yaml" \
+  "${PREFIX}/modules/ssm-jump/ssm-jump.yaml" \
+  "${PREFIX}/modules/network/network.yaml" \
+  "${PREFIX}/modules/bigip-standalone/bigip-standalone.yaml" \
+  "${PREFIX}/f5-bigip-runtime-init-2.0.3-1.gz.run" \
+  "${PREFIX}/bigip-extensions/f5-declarative-onboarding-1.47.0-14.noarch.rpm" \
+  "${PREFIX}/bigip-extensions/f5-appsvcs-3.56.0-10.noarch.rpm" \
+  "${PREFIX}/bigip-extensions/f5-cloud-failover-2.4.0-0.noarch.rpm" \
+  "${PREFIX}/autoscale/bigip-configurations/Rapid_Deployment_Policy_13_1.xml"; do
+  printf '%s  %s\n' \
+    "$(curl -sk -o /dev/null -w '%{http_code}' "https://${BUCKET}.s3.${REGION}.amazonaws.com/${KEY}")" "$KEY"
+done
+```
+
+`403` means the policy or Block Public Access setting has not taken effect. `404` on the
+`.run` or an `.rpm` means it was never uploaded — it is not part of `s3 sync`.
+
+### 4.6 Pre-flight checks
+
+Two lookups that fail *cheaply* now instead of expensively mid-deploy.
+
+**The jump host image.** The jump host resolves its AMI from an AWS-published SSM
+parameter. If that parameter is not present in your Region, the nested stack fails at
+create time:
+
+```bash
+aws ssm get-parameter --region "$REGION" \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --query 'Parameter.Value' --output text
+```
+
+An AMI ID means you are fine. An error means you must pass your own image as
+`ssmJumpCustomImageId` — any AMI works provided the SSM Agent is installed and starts at
+boot (Amazon Linux 2 and 2023 both do, as do most hardened AL2023 builds).
+
+**The BIG-IP image.** The template looks up the BIG-IP AMI by name pattern, and
+availability differs by Region:
+
+```bash
+aws ec2 describe-images --region "$REGION" --owners aws-marketplace \
+  --filters "Name=name,Values=*17.5.1.6-0.0.25*PAYG-Best Plus 25Mbps*" \
+  --query 'reverse(sort_by(Images,&CreationDate))[].[Name,ImageId,CreationDate]' --output table
+```
+
+An empty result means the pinned default is not in your Region — find one that is, and set
+`bigIpImage` to a pattern pinned to that version and build with the trailing timestamp
+wildcarded, e.g. `*17.5.1.6-0.0.25*PAYG-Best Plus 25Mbps*`.
+
+> ⚠️ **Use a "Best" image.** The onboarding declaration provisions ASM and the AS3
+> declaration attaches a WAF policy. ASM exists only in the **Best** bundle — a "Good" or
+> "Better" image onboards partway and then fails.
+
+### 4.7 Fill in the parameters
+
+Edit `examples/failover-airgap/failover-airgap-parameters.json`. Four values are genuinely
+required:
+
+| Parameter | Value |
+|---|---|
+| `bigIpSecretArn` | The full secret ARN from step 4.2 |
+| `sshKey` | The key pair **name** from step 4.3 (e.g. `f5-airgap-key`) |
+| `restrictedSrcAddressMgmt` | Source CIDR allowed to reach BIG-IP management |
+| `restrictedSrcAddressApp` | Source CIDR allowed to reach the application |
+
+Also confirm `s3BucketName` and `s3BucketRegion` match your bucket and Region.
+
+> The security groups already permit the VPC CIDR on management (22, 443) and on the
+> application (80, 443), so the jump host and in-VPC clients work regardless of what you
+> put in `restrictedSrcAddress*`. Those two parameters control access from **outside** the
+> VPC. Set them deliberately rather than leaving them empty by accident.
+
+Everything else can stay at its default. Parameters left empty are optional overrides —
+`bigIpRuntimeInitPackageUrl` and `bigIpRuntimeInitConfig01/02` auto-derive from your bucket
+settings, `cfeS3Bucket` is created for you, and `bigIpLicenseKey*` is BYOL-only.
+
+The full parameter reference is in [README.md](README.md#template-input-parameters).
+
+### 4.8 Launch
+
+```bash
+aws cloudformation create-stack --region "$REGION" \
+  --stack-name "$STACK" \
+  --template-url "https://${BUCKET}.s3.${REGION}.amazonaws.com/${PREFIX}/failover-airgap/failover-airgap.yaml" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters file://examples/failover-airgap/failover-airgap-parameters.json
+```
+
+> **On your first deployment, consider adding `--on-failure DO_NOTHING`.** By default a
+> failed stack deletes its instances, taking the logs with it. `DO_NOTHING` preserves them
+> so you can get on the boxes and read what happened. You clean up manually afterwards.
+
+### 4.9 What to expect while it builds
+
+**`CREATE_IN_PROGRESS` for roughly 25–30 minutes is normal**, not a hang. BIG-IP has a
+documented device-trust startup bug where `/Common/Root` is not initialised on first boot,
+so this solution installs a self-heal script that reboots each device once and forms the
+cluster out of band. The stack only signals success once the cluster is genuinely
+**In Sync**. The signal timeout is 50 minutes, after which a real failure surfaces as
+`CREATE_FAILED` rather than hanging forever.
+
+Watch progress:
+
+```bash
+aws cloudformation describe-stack-events --region "$REGION" --stack-name "$STACK" \
+  --query 'StackEvents[?ResourceStatus!=`CREATE_IN_PROGRESS`].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]' \
+  --output table | head -40
+```
+
+When it completes, read the outputs — they contain everything you need next:
+
+```bash
+aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+  --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
+```
+
+### 4.10 What the self-heal is doing during those 25–30 minutes
+
+Worth understanding, because it explains the long build and it is where you look first when
+a build stalls.
+
+**The problem it works around.** There is a documented BIG-IP / Declarative Onboarding
+platform bug in the 17.x line: the device-trust domain `/Common/Root` is not fully
+initialised after system startup. When it hits, DO cannot create the device trust or the
+failover device group, clustering deadlocks — one device waiting for `Root`, the other for
+the device group — and `/var/log/restnoded/restnoded.log` shows:
+
+```
+01020036:3: The requested trust domain (/Common/Root) was not found.
+01020036:3: The requested device group (/Common/failoverGroup) was not found.
+```
+
+F5's documented workaround is *reboot (which rebuilds `Root`), then re-apply clustering*.
+This is a platform timing issue — **not** caused by GovCloud, the security groups, the VPC
+endpoints, or this template — and you cannot avoid it by choosing a different 17.x image.
+
+**What ships to handle it.** The runtime-init config installs three things through its
+`pre_onboard` hook:
+
+| File | Purpose |
+|---|---|
+| `/config/cluster-heal.sh` | The orchestrator |
+| `/config/cluster-heal-trust.py` | Fetches the admin password from Secrets Manager (SigV4, via the instance role) and calls `add-to-trust`. Stdlib-only, because BIG-IP has no `aws` CLI or `boto3` |
+| `/etc/cron.d/cluster-heal` | Runs the orchestrator every 3 minutes |
+
+**The DO declaration is left stock.** DO remains the declarative source of truth; the
+self-heal only bootstraps what the platform bug prevented it from finishing, and the
+resulting cluster matches the DO declaration. On a build where the bug does not occur, the
+self-heal sees the cluster already In Sync and disables itself. It is a safety net, not a
+dependency.
+
+**What it does, per device, every 3 minutes — marker-gated so it never loops:**
+
+1. Already In Sync? → signal CloudFormation success, remove the cron, mark done, stop.
+2. Wait until onboarding has set the hostname and the box has been up long enough.
+3. `Root` missing (the bug)? → save config and **reboot once** to rebuild it.
+4. Trust not formed after the reboot? The **joiner** fetches the admin password and runs
+   `add-to-trust` against the peer; the **owner** waits for the joiner.
+5. Trust formed? → the owner creates `failoverGroup`, ensures `/LOCAL_ONLY` is excluded from
+   config-sync, force-syncs, and each device acts on any sync recommendation.
+6. In Sync → signal CloudFormation success, then disable itself.
+
+That CloudFormation signal in steps 1 and 6 is why the CloudFormation VPC endpoint matters:
+with no egress, the BIG-IP cannot reach `cloudformation.<region>.amazonaws.com`, and the
+stack would time out even though the cluster formed correctly.
+
+**Watching it.** From a jump host shell, SSH to a BIG-IP and:
+
+```bash
+tail -f /config/cluster-heal/log
+```
+
+That is the primary place to look — it narrates each phase: pre-reboot waits → reboot →
+`add-to-trust` → `creating failoverGroup` → sync → `cluster In Sync` → `cfn-signal sent OK`
+→ `disabling self-heal`. Marker files in `/config/cluster-heal/` (`rebooted`, `trust_tries`,
+`signalled`, `done`) show how far it has got. Also useful:
+`tmsh show cm sync-status`, `/var/log/cloud/bigIpRuntimeInit.log`,
+`/var/log/restnoded/restnoded.log`.
+
+> **Build times vary a lot.** A device that does not hit the bug clusters in about
+> 6 minutes; one that does needs the reboot and retry cycle and can take 40+. Both are
+> normal. **Let the full 50-minute timeout elapse before concluding a build has failed** —
+> we killed a healthy build at 40 minutes during validation and learned nothing from it.
+
+---
+
+## 5. Getting into the BIG-IPs with Session Manager
+
+There are no public IP addresses, so there is no SSH-from-the-internet. Instead you reach
+the BIG-IPs *through* the jump host using AWS Systems Manager Session Manager.
+
+**The important idea:** this is not a network connection into the VPC. The jump host makes
+an **outbound** connection to the SSM service through the VPC endpoints; your workstation
+talks to the **AWS API**; AWS brokers the two together. There is no inbound path, no open
+port and no public address anywhere — which is exactly why it suits an air-gapped design.
+Access is authorised by IAM and logged in CloudTrail.
+
+```mermaid
+flowchart LR
+    WS["👤 Your workstation<br/>localhost:8443"]
+    API["AWS SSM API<br/><i>IAM-authorised, CloudTrail-logged</i>"]
+    JH["🖥️ Jump host<br/>no public IP<br/>no inbound rules"]
+    BIP["BIG-IP mgmt<br/>10.0.1.11:443"]
+
+    WS -->|"① aws ssm start-session<br/>(outbound HTTPS)"| API
+    JH -->|"② SSM Agent connects OUT<br/>via ssm/ssmmessages/ec2messages<br/>VPC endpoints"| API
+    API -.->|"③ AWS brokers the two"| JH
+    JH -->|"④ forwards to"| BIP
+    BIP -.->|"tunnelled back to<br/>https://localhost:8443"| WS
+
+    classDef nobox fill:#fff,stroke:#c5221f,stroke-dasharray: 4 3,color:#c5221f
+    class JH nobox
+```
+
+### 5.1 The BIG-IP web GUI (TMUI)
+
+The management interface has no public address, so you cannot browse to it directly.
+Instead you forward a port on **your own machine** through the jump host to the BIG-IP's
+management interface — then the GUI appears at `https://localhost:<port>` in your normal
+browser, exactly as if it were running locally.
+
+The stack gives you the complete command as an output, so you do not have to build it.
+
+**Step 1 — get the command:**
+
+```bash
+aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+  --query "Stacks[0].Outputs[?OutputKey=='ssmPortForwardBigIp01'].OutputValue" --output text
+```
+
+That prints something like:
+
+```
+aws ssm start-session --region us-gov-east-1 --target i-09fc242906bd8b56a \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["10.0.1.11"],"portNumber":["443"],"localPortNumber":["8443"]}'
+```
+
+**Step 2 — paste and run it.** You should see:
+
+```
+Starting session with SessionId: your.name@example.com-0123456789abcdef
+Port 8443 opened for sessionId ...
+```
+
+**Leave this terminal window open.** The tunnel exists only while the command runs —
+closing the window or pressing `Ctrl+C` closes the GUI connection.
+
+**Step 3 — open a browser** and go to:
+
+```
+https://localhost:8443
+```
+
+**Step 4 — accept the certificate warning.** BIG-IP ships with a self-signed certificate,
+and your browser is being asked for `localhost` while the certificate names the device, so
+a warning is expected and normal here. In Chrome/Edge click **Advanced → Proceed to
+localhost (unsafe)**; in Firefox, **Advanced → Accept the Risk and Continue**; in Safari,
+**Show Details → visit this website**.
+
+**Step 5 — log in:**
+
+| Field | Value |
+|---|---|
+| Username | `admin` |
+| Password | The value of your `bigIpSecretArn` secret |
+
+Retrieve the password with:
+
+```bash
+aws secretsmanager get-secret-value --region "$REGION" \
+  --secret-id <your-secret-arn> --query SecretString --output text
+```
+
+**For the second BIG-IP**, use the `ssmPortForwardBigIp02` output, which forwards to
+`https://localhost:8444`. Each `start-session` holds its own terminal, so to have both GUIs
+open at once, run the two commands in two separate terminal windows. The two local ports
+(8443 and 8444) keep them apart.
+
+> **Both devices share one admin password** — they read it from the same secret. That
+> shared credential is also what lets them establish device trust with each other.
+
+**REST API calls work through the same tunnel.** Anything you would `curl` against the
+management interface just uses `localhost:8443`:
+
+```bash
+curl -sku admin:"$PW" https://localhost:8443/mgmt/shared/cloud-failover/inspect \
+  | python3 -m json.tool
+```
+
+<details>
+<summary><b>If the GUI will not load</b> (click to expand)</summary>
+
+| Symptom | Cause |
+|---|---|
+| `SessionManagerPlugin is not found` | The plugin is not installed — see [section 3.2](#32-on-your-workstation), then run `hash -r`. |
+| `TargetNotConnected` | The jump host has not registered with Systems Manager. See [troubleshooting](#targetnotconnected-or-the-jump-host-never-appears-in-systems-manager). |
+| Browser says "connection refused" | The `start-session` command is not running, or you closed its window. Re-run it. |
+| `Port 8443 in use` | Something else on your machine holds that port. Change `localPortNumber` to any free port (e.g. `8543`) and browse there instead. |
+| Session starts, page hangs | The BIG-IP is still onboarding. Management comes up before configuration finishes; wait for the stack to reach `CREATE_COMPLETE`. |
+| `AccessDeniedException` on `StartSession` | Your IAM identity lacks `ssm:StartSession` on the instance or on the `AWS-StartPortForwardingSessionToRemoteHost` document. |
+
+</details>
+
+### 5.2 A shell on the jump host
+
+This is your in-VPC test client — the easiest place to `curl` the VIP from.
+
+```bash
+JUMP=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
   --query "Stacks[0].Outputs[?OutputKey=='ssmJumpInstanceId'].OutputValue" --output text)
-MGMT_01=10.0.1.11   # bigIpInstanceMgmtPrivateIp01 output
-MGMT_02=10.0.5.11   # bigIpInstanceMgmtPrivateIp02 output
 
-# GUI / REST: localhost:8443 -> BIG-IP A management 443 (the ssmPortForwardBigIp01 output is this command)
-aws ssm start-session --region "$REGION" --target "$JUMP" \
-  --document-name AWS-StartPortForwardingSessionToRemoteHost \
-  --parameters "{\"host\":[\"$MGMT_01\"],\"portNumber\":[\"443\"],\"localPortNumber\":[\"8443\"]}"
-# then browse https://localhost:8443 and curl -sku admin:"$PW" https://localhost:8443/mgmt/...
-
-# SSH: localhost:2222 -> BIG-IP A management 22
-aws ssm start-session --region "$REGION" --target "$JUMP" \
-  --document-name AWS-StartPortForwardingSessionToRemoteHost \
-  --parameters "{\"host\":[\"$MGMT_01\"],\"portNumber\":[\"22\"],\"localPortNumber\":[\"2222\"]}"
-ssh -p 2222 admin@localhost
-
-# A shell on the jump host itself - the place to curl the VIP from inside the VPC
 aws ssm start-session --region "$REGION" --target "$JUMP"
 ```
 
-Each `start-session` holds the terminal; run them in separate windows. Use `8444` /
-`2223` for BIG-IP B, or just paste the `ssmPortForwardBigIp02` output.
+### 5.3 SSH to a BIG-IP
 
-**The GUI works through the tunnel.** With the first command running, browse
-`https://localhost:8443`, accept the BIG-IP's self-signed certificate warning, and log in
-as `admin` with the password from `bigIpSecretArn`. REST calls work the same way
-(`curl -sku admin:"$PW" https://localhost:8443/mgmt/shared/cloud-failover/inspect`).
-
-> **Session logging.** Session Manager can write every session's keystrokes to CloudWatch
-> Logs or S3, which is materially better evidence for an ATO package than a bastion's
-> syslog. It is an account-level Session Manager preference, not a stack resource, so this
-> template does not configure it; enable it in Systems Manager → Session Manager →
-> Preferences before the first customer-facing use.
-
-## 5. Verifying - do this in both directions
-
-Open a port-forward to each BIG-IP as in section 4a (or, if you chose the bastion,
-`ssh -J ec2-user@<bastion> admin@<mgmt-ip>`), then:
+Easiest from a jump host shell — its security group already allows outbound 22 into the
+VPC, and the BIG-IP management group allows 22 from the VPC CIDR:
 
 ```bash
-REGION=us-gov-west-1
-RTBS=$(aws cloudformation describe-stacks --region "$REGION" --stack-name failover-airgap \
-  --query "Stacks[0].Outputs[?OutputKey=='vipRouteTableIds'].OutputValue" --output text | tr ',' ' ')
-ENI_01=...   # bigIpExternalInterfaceId01 output
-ENI_02=...   # bigIpExternalInterfaceId02 output
-
-# 1. Source/dest check must be False on both external ENIs
-aws ec2 describe-network-interfaces --region "$REGION" --network-interface-ids "$ENI_01" "$ENI_02" \
-  --query 'NetworkInterfaces[].[NetworkInterfaceId,SourceDestCheck]' --output text
-
-# 2. Every route table must be tagged and carry the VIP route
-aws ec2 describe-route-tables --region "$REGION" --route-table-ids $RTBS \
-  --query 'RouteTables[].[RouteTableId,Tags[?Key==`f5_cloud_failover_label`].Value|[0],Routes[?DestinationCidrBlock==`10.99.0.0/24`].NetworkInterfaceId|[0]]' --output table
-
-# 3. On each BIG-IP, CFE must report the route - "routes" must NOT be empty
-curl -sku admin:"$PW" https://localhost/mgmt/shared/cloud-failover/inspect | python3 -m json.tool
-
-# 4. On the STANDBY, a dry run shows what a failover would change
-curl -sku admin:"$PW" -X POST -d '{"action":"dry-run"}' \
-  https://localhost/mgmt/shared/cloud-failover/trigger | python3 -m json.tool
-
-# 5. Fail over from the active device, and time the route change
-tmsh run sys failover standby
-watch -n2 "aws ec2 describe-route-tables --region $REGION --route-table-ids $RTBS \
-  --query 'RouteTables[].Routes[?DestinationCidrBlock==\`10.99.0.0/24\`].NetworkInterfaceId' --output text"
-
-# 6. From a client in the VPC, the VIP must answer before and after. A Session Manager shell
-#    on the jump host is the easiest client: aws ssm start-session --target "$JUMP"
-#    With no back-end app deployed, the demo responder answers and names the device:
-curl -sk https://10.99.0.100/ | grep -o 'failover0[12][.a-z]*'     # flips after step 5
+# on the jump host
+ssh admin@10.0.1.11        # failover01   (bigIpInstanceMgmtPrivateIp01)
+ssh admin@10.0.5.11        # failover02   (bigIpInstanceMgmtPrivateIp02)
 ```
 
-Then fail back and repeat. IAM and endpoint problems sometimes surface on only one
-instance. Record the time between step 5 and the route showing the new target; that is the
-number a customer with an RTO needs.
+Use the admin password from your secret — **the same password on both devices**. Retrieve
+it with:
 
-### 5a. Showing it in a browser
+```bash
+aws secretsmanager get-secret-value --region "$REGION" \
+  --secret-id <your-secret-arn> --query SecretString --output text
+```
 
-Every AS3 declaration in this directory carries a `Demo_Responder` iRule. When the VIP's
-pool has no active members - which is the case with `provisionExampleApp=false` - it
-answers HTTP and HTTPS requests itself with a page that names the BIG-IP that served it,
-the VIP address, the client address and the time, and refreshes itself every two seconds.
-When the example app (or any real pool member) is present the rule returns immediately and
-traffic is load balanced as normal, so it never has to be removed.
+Alternatively, forward a local port to management SSH and connect from your workstation:
 
-For a demo, forward a local port to the VIP through the jump host and leave the page open
-while you fail over:
+```bash
+aws ssm start-session --region "$REGION" --target "$JUMP" \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["10.0.1.11"],"portNumber":["22"],"localPortNumber":["2222"]}'
+# then, in another window:
+ssh -p 2222 admin@localhost
+```
+
+> **Session logging.** Session Manager can record every session's keystrokes to CloudWatch
+> Logs or S3 — materially better evidence for an ATO package than a bastion's syslog. It is
+> an account-level Session Manager preference rather than a stack resource, so this
+> template does not configure it. Enable it under **Systems Manager → Session Manager →
+> Preferences** before first customer-facing use.
+
+---
+
+## 6. Validating the deployment
+
+Run these after `CREATE_COMPLETE`, before testing failover. They confirm the five
+requirements from [section 2](#five-things-must-line-up) are actually in place.
+
+First collect the values you need:
+
+```bash
+aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+  --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
+```
+
+Note `bigIpExternalInterfaceId01/02`, `vipRouteTableIds`, `vipAddress` and
+`ssmJumpInstanceId` — the checks below use them. Substitute your own IDs for the examples.
+
+**Check 1 — source/destination checking must be `False` on both external interfaces:**
+
+```bash
+aws ec2 describe-network-interfaces --region "$REGION" \
+  --network-interface-ids eni-AAAA eni-BBBB \
+  --query 'NetworkInterfaces[].[NetworkInterfaceId,SourceDestCheck]' --output table
+```
+
+**Check 2 — every route table tagged, and carrying the VIP route:**
+
+```bash
+aws ec2 describe-route-tables --region "$REGION" \
+  --route-table-ids rtb-AAAA rtb-BBBB rtb-CCCC \
+  --query "RouteTables[].[RouteTableId,Tags[?Key=='f5_cloud_failover_label'].Value|[0],Routes[?DestinationCidrBlock=='10.99.0.0/24'].NetworkInterfaceId|[0]]" \
+  --output table
+```
+
+All three rows should show the tag value (`bigip_high_availability_solution` by default)
+and the **same** external interface ID — instance A's, since the template points them
+there initially.
+
+**Check 3 — CFE has discovered the routes.** From a jump host shell:
+
+```bash
+PW='<admin password>'
+curl -sku admin:"$PW" https://10.0.1.11/mgmt/shared/cloud-failover/inspect | python3 -m json.tool
+```
+
+`"routes"` must list your three route tables. `"addresses"` being empty is correct — this
+design has no Elastic IPs to move. Note which device reports `"deviceStatus": "active"`.
+
+**Check 4 — the next-hop list must contain bare addresses.** On **both** devices:
+
+```bash
+curl -sku admin:"$PW" https://10.0.1.11/mgmt/shared/cloud-failover/declare \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["declaration"]["failoverRoutes"]["routeGroupDefinitions"][0]["defaultNextHopAddresses"]["items"])'
+# → ['10.0.0.11', '10.0.4.11']     ✅ both bare
+# → ['10.0.0.11/24', '10.0.4.11']  ❌ see troubleshooting
+```
+
+**Check 5 — the active device and the route target must agree.** This one catches a real
+condition seen in the lab: the template points all three routes at instance A when the stack
+is built, but the initial election can make **instance B** active. CFE only acts on a
+failover *transition*, so coming up active at boot does not move the routes - and the stack
+reaches `CREATE_COMPLETE` with a VIP that has never passed traffic.
+
+Compare the `deviceStatus` from check 3 with the route target from check 2. If they name
+different devices, run **one** failover from the active device to sync them:
+
+```bash
+tmsh run sys failover standby
+```
+
+Then re-check. This is a normal post-deployment step, not a fault.
+
+**Check 6 — the VIP answers.** From a jump host shell:
+
+```bash
+curl -sk https://10.99.0.100/ | grep -oE 'failover0[12][.a-z]*'
+```
+
+With no back-end application deployed, a built-in iRule answers and names the device that
+served the request. Confirm it matches the device reporting `active` in check 3. If the
+route points at the standby, the VIP will hang — see
+[troubleshooting](#the-vip-does-not-answer-at-all).
+
+---
+
+## 7. Seeing it work in a browser
+
+Every AS3 declaration here carries a `Demo_Responder` iRule. When the VIP's pool has no
+active members — the case with `provisionExampleApp=false`, the default — it answers HTTP
+and HTTPS itself with a page naming the BIG-IP that served it, the VIP, the client address
+and the time, refreshing every two seconds. When a real back end is present, the rule steps
+aside and traffic is load balanced normally, so it never needs removing.
+
+For a demo, forward a local port to the VIP and leave the page open while you fail over:
 
 ```bash
 aws ssm start-session --region "$REGION" --target "$JUMP" \
   --document-name AWS-StartPortForwardingSessionToRemoteHost \
   --parameters '{"host":["10.99.0.100"],"portNumber":["443"],"localPortNumber":["9443"]}'
-# browse https://localhost:9443 - "Served by failover02.local" becomes failover01.local
-# a few seconds after "tmsh run sys failover standby" on the active device
+# browse https://localhost:9443
 ```
 
-The page turning over is the whole failover mechanism in one screen: the route moved,
-the peer became active, and the client never changed the address it was talking to.
+"Served by failover01.local" becomes "failover02.local" a few seconds after you trigger a
+failover. The page turning over is the whole mechanism in one screen: the route moved, the
+peer took over, and the client never changed the address it was talking to.
 
-## 6. Two things to plan for
+Expect the tunnel to log a connection error at the moment of failover — the TCP session to
+the old active device dies, and the page's auto-refresh re-establishes it. For *measuring*
+convergence, prefer the on-host loop in section 8; the tunnel adds a variable you do not
+want in the numbers.
 
-**Reachability beyond the VPC.** The template routes the VIP prefix inside the VPC only.
+---
+
+## 8. Testing failover
+
+**Test both directions.** They exercise different devices, and a fault can exist in only
+one — which is exactly what happened during validation of this design.
+
+**Window 1** — a shell on the jump host, running the measurement loop. Start it *before*
+you trigger anything:
+
+```bash
+aws ssm start-session --region "$REGION" --target "$JUMP"
+```
+```bash
+while true; do
+  T=$(date +%H:%M:%S.%2N)
+  R=$(curl -sk --max-time 1 https://10.99.0.100/ | grep -oE 'failover0[12][.a-z]*' | head -1)
+  echo "$T ${R:-DOWN}"
+  sleep 0.5
+done
+```
+
+**Window 2** — a second jump host shell; SSH to whichever device is **active** and trigger:
+
+```bash
+ssh admin@10.0.1.11
+tmsh show cm failover-status      # confirm this device is ACTIVE first
+tmsh run sys failover standby
+```
+
+> ⚠️ **Issue `failover standby` on the active device only, once.** Running it on both
+> devices in sequence can leave neither holding the traffic group, which looks exactly like
+> a broken design but is a test artifact. Always confirm state with
+> `tmsh show cm failover-status` before triggering.
+
+**Read the result from the timestamps, not the line count.** Failed requests take the full
+`--max-time 1` plus the sleep, so they are ~1.5 s apart while successful ones are ~0.5 s
+apart. Counting `DOWN` lines badly understates the outage. Measure last-good to first-good:
+
+```
+17:51:51.30  failover01.local   ← last good response from A
+17:51:51.82  DOWN
+   ...
+17:51:59.37  DOWN
+17:52:00.88  failover02.local   ← first good response from B
+```
+
+**Confirm the routes actually moved:**
+
+```bash
+aws ec2 describe-route-tables --region "$REGION" \
+  --route-table-ids rtb-AAAA rtb-BBBB rtb-CCCC \
+  --query "RouteTables[].[RouteTableId,Routes[?DestinationCidrBlock=='10.99.0.0/24'].NetworkInterfaceId|[0]]" \
+  --output table
+```
+
+All three should now show the *other* device's interface. And on the newly active device,
+the log should show the work being done:
+
+```bash
+grep -E 'Next hop address|Update required|Route\(s\) updated|No route operations' \
+  /var/log/restnoded/restnoded.log | tail -12
+# want: "Next hop address: 10.0.x.11" and "Route(s) updated successfully"
+# not:  "Next hop address: undefined" or "No route operations to run"
+```
+
+Then fail back and repeat.
+
+### Measured results
+
+| | |
+|---|---|
+| **Date / Region** | 2026-09-08, `us-gov-east-1` |
+| **Build** | 3-NIC PAYG, BIG-IP 17.5.1.6-0.0.25, CFE 2.4.0, DO 1.47.0, AS3 3.56.0 |
+| **Method** | 0.5 s poll from an in-VPC client, last-good to first-good response |
+| **A → B** | 6 – 9.6 seconds |
+| **B → A** | 6 – 9.6 seconds |
+
+Individual runs, all last-good to first-good: **9.58 s**, **~6 s**, **9.58 s**. The same
+pair on the same build converged in 6 seconds once and 9.6 seconds twice, so **run-to-run
+variance is real** — treat any single measurement as indicative, not definitive.
+
+This is a small sample in one environment. Measure it in your own before committing to a
+Recovery Time Objective, and quote a figure with headroom — **10 seconds** is a reasonable
+number to put in front of a customer for a design measured between 6 and 10.
+
+> Note this is *better* than route-based failover is usually assumed to be. Earlier drafts
+> of this guide estimated "tens of seconds"; the measured behaviour stays under ten.
+
+---
+
+## 9. What to plan for
+
+**Reachability beyond the VPC.** The template routes the VIP prefix *inside* this VPC only.
 Clients arriving over Direct Connect, VPN or a Transit Gateway need `externalVipCidr`
-propagated into *those* route tables. Straightforward, but it is a conversation with the
+propagated into *their* route tables. Straightforward, but it is a conversation with the
 customer's network team and belongs in the design, not in testing.
 
-**Convergence is slower than an EIP move.** Route table updates take longer to take effect
-than an address reassociation. Plan on tens of seconds rather than a handful, and measure
-it in step 5 before committing to an RTO.
+**Monitoring must check the route, not just CFE.** CFE writes
+`taskState: SUCCEEDED` / `Failover Complete` even when it performs **zero** route
+operations, and `inspect` still looks healthy. A health check that only watches CFE's own
+status will miss a total VIP outage. Any production monitoring should compare **the actual
+route target against the actual active device**:
 
-## 7. Troubleshooting
+```bash
+# both must agree — the route must point at the device reporting "active"
+aws ec2 describe-route-tables --region "$REGION" --route-table-ids rtb-AAAA \
+  --query "RouteTables[].Routes[?DestinationCidrBlock=='10.99.0.0/24'].NetworkInterfaceId" --output text
+curl -sku admin:"$PW" https://10.0.1.11/mgmt/shared/cloud-failover/inspect \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["hostName"], d["deviceStatus"])'
+```
 
-**Route moves, VIP does not answer.** Source/dest check is still enabled on an external
-ENI (step 1 above). The template disables it on the ENI resource, so if it is `True`
-something recreated the interface outside the stack.
+**The VIP routes drift from the template by design.** CFE changes their target on every
+failover, so after the first one the live route will not match what CloudFormation
+declared. Never change a property of those route resources in a stack update —
+CloudFormation would re-point them at instance A regardless of which device is active. To
+change the prefix, redeploy.
 
-**`routes` is empty in `inspect`.** CFE found no tagged route table, or none with a route
-for exactly `externalVipCidr`. Check step 2. A prefix mismatch between the route and the
-scoping range is the usual cause when someone edits one side.
+---
 
-**`UnauthorizedOperation` on `ReplaceRoute` in `/var/log/restnoded/restnoded.log`.** The
-route table has lost its `f5_cloud_failover_label` tag, or `cfeTag` was changed on one side
-only. The IAM condition is on the tag value matching `cfeTag` exactly.
+## 10. Tearing the stack down
 
-**`Failover initialization failed` / `ECONNREFUSED`.** The endpoints. This template always
-provisions them, so check the security group on the interface endpoints and that the stack
-Region matches the bucket Region, as in the GovCloud guide.
+Cloud Failover Extension creates an S3 bucket for its failover state, and **CloudFormation
+cannot delete a bucket that still has objects in it**. Empty it first or the stack delete
+fails partway and leaves resources behind:
 
-**Jump host never appears in Systems Manager (`start-session` says the target is not
-connected).** The SSM Agent could not reach the `ssm` / `ssmmessages` / `ec2messages`
-endpoints. Check that the three endpoints exist in the stack, that their security group
-allows 443 from the VPC CIDR, and that private DNS is enabled on them. The agent needs a
-few minutes after boot; `aws ssm describe-instance-information` lists it once registered.
+```bash
+STACK=<your-stack-name>
 
-**Everything else** - clustering, the self-heal, secrets, image lookup - is covered in the
-GovCloud guide's troubleshooting section and applies unchanged.
+CFEB=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+  --query "Stacks[0].Outputs[?OutputKey=='cfeS3Bucket'].OutputValue" --output text)
+echo "CFE state bucket: $CFEB"
+
+aws s3 rm "s3://$CFEB" --recursive
+aws cloudformation delete-stack --stack-name "$STACK"
+aws cloudformation wait stack-delete-complete --stack-name "$STACK" && echo deleted
+```
+
+> ⚠️ `$CFEB` is CFE's **state** bucket, created by the stack. It is not your staging bucket
+> of templates and artifacts — do not delete that one.
+
+**Never run this against a stack that is still building.** Deleting the CFE state bucket of
+a live stack removes the file the extension is actively using. If you need to abandon a
+build in progress, delete the stack and let CloudFormation remove the bucket with it.
+
+**Then confirm nothing billable survived.** A delete that fails partway can strand NAT
+gateways and Elastic IPs, both of which bill by the hour:
+
+```bash
+aws ec2 describe-nat-gateways --filter "Name=state,Values=available,pending" \
+  --query 'NatGateways[].[NatGatewayId,VpcId,State]' --output table
+aws ec2 describe-addresses --query 'Addresses[].[PublicIp,AllocationId,AssociationId]' --output table
+aws ec2 describe-instances --filters "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value]' --output table
+```
+
+All three should be empty for this stack. A current air-gap deployment creates no NAT
+gateways or Elastic IPs at all, so any that appear are either from another stack or from an
+older deployment built before that change.
+
+**If the delete fails**, find the blocking resource rather than retrying blindly:
+
+```bash
+aws cloudformation describe-stack-events --stack-name "$STACK" \
+  --query 'StackEvents[?ResourceStatus==`DELETE_FAILED`].[LogicalResourceId,ResourceType,ResourceStatusReason]' \
+  --output table
+```
+
+The usual causes are the CFE bucket having been repopulated (empty it again — the instances
+are gone by then, so nothing will rewrite it) or an interface still detaching, which
+generally clears on a retry a few minutes later. As a last resort you can abandon a specific
+resource, but anything retained stays in your account and must be deleted by hand:
+
+```bash
+aws cloudformation delete-stack --stack-name "$STACK" --retain-resources <LogicalResourceId>
+```
+
+**What survives deliberately.** The admin secret and the SSH key pair are not stack
+resources when you supply them yourself, so they persist for the next deployment. If you
+let the stack generate the secret, it is deleted with the stack but held under Secrets
+Manager's recovery window (30 days by default), so repeated deploy/destroy cycles
+accumulate `*-bigIpSecret-*` entries with identical name prefixes. Creating one secret
+yourself and passing `bigIpSecretArn` avoids both the clutter and a new random password on
+every build.
+
+---
+
+## 11. Troubleshooting
+
+### `SessionManagerPlugin is not found`
+
+The Session Manager plugin is not installed on your workstation. It is a separate install
+from the AWS CLI — see [section 3.2](#32-on-your-workstation). After installing, run
+`hash -r` so your shell picks up the new binary.
+
+### `TargetNotConnected`, or the jump host never appears in Systems Manager
+
+The SSM Agent could not reach the `ssm`, `ssmmessages` or `ec2messages` endpoints. Confirm
+the agent has registered:
+
+```bash
+aws ssm describe-instance-information --region "$REGION" \
+  --query "InstanceInformationList[?InstanceId=='i-XXXX'].[InstanceId,PingStatus,AgentVersion]" \
+  --output table
+```
+
+An empty result means it never checked in. Verify all three endpoints exist in the stack,
+that their security group allows 443 from the VPC CIDR, and that private DNS is enabled on
+them. The agent also needs a few minutes after boot — if the stack just completed, wait
+before concluding anything.
+
+### Failover "succeeds" but the route never moves
+
+Symptom: one direction works and the other leaves the VIP dark indefinitely, while CFE
+reports success on both. On the device that failed,
+`/var/log/restnoded/restnoded.log` shows:
+
+```
+warning: [f5-cloud-failover] Next hop address to use is empty: 10.0.0.11,10.0.2.11  10.0.0.11/24,10.0.4.11
+finest:  [f5-cloud-failover] Next hop address: undefined
+finest:  [f5-cloud-failover] routesDiscovered: {"operations":[]}
+info:    [f5-cloud-failover] No route operations to run
+info:    [f5-cloud-failover] Failover Complete
+```
+
+CFE resolved no next hop, ran **zero** route operations, and still wrote
+`taskState: SUCCEEDED`. `inspect` looks healthy throughout — the only evidence is those
+lines and a route still pointing at the standby.
+
+**Cause:** a `/mask` on a next-hop entry. CFE matches `defaultNextHopAddresses` items
+against the device's own local addresses, and `10.0.0.11/24` never equals `10.0.0.11`.
+Because the CFE declaration is config-synced across the device group, both devices share
+one list, so only the device named by the masked entry fails — hence the one-directional
+failure. Check what is deployed:
+
+```bash
+curl -sku admin:"$PW" https://localhost/mgmt/shared/cloud-failover/declare \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["declaration"]["failoverRoutes"]["routeGroupDefinitions"][0]["defaultNextHopAddresses"]["items"])'
+```
+
+Every item must be bare. If any carries a mask, your runtime-init config is using
+`SELF_IP_EXTERNAL` (masked, because the DO `SelfIp` class requires it) instead of the
+tag-sourced `OWN_SELF_IP_EXTERNAL`. **Fixed in this directory as of 2026-09-08** — re-stage
+the bucket and redeploy if you are running an older copy.
+
+### The VIP does not answer at all
+
+Work through these in order:
+
+1. **Which device is active, and where does the route point?** They must agree. Compare
+   `tmsh show cm failover-status` on each device with the route table query in
+   [section 6](#6-validating-the-deployment). The template points the routes at instance A
+   at creation time, so if instance B came up active first, the VIP is black-holed until
+   the first failover.
+2. **Is either device active at all?** Running `failover standby` on both devices can leave
+   neither holding the traffic group. Run `tmsh show cm failover-status` on both; if both
+   say `STANDBY`, run `tmsh run sys failover standby` on **one** device only, which pushes
+   the traffic group to its peer.
+3. **Source/destination check** — must be `False` on both external interfaces. The template
+   disables it on the interface resource, so if it is `True` something recreated the
+   interface outside the stack.
+4. **Is the AS3 virtual server there?** `tmsh list ltm virtual` on the active device should
+   show a virtual on the VIP address.
+
+### `"routes"` is empty in `inspect`
+
+CFE found no tagged route table, or none carrying a route for exactly `externalVipCidr`.
+Check the route table query in section 6. A prefix mismatch between the route and the
+scoping range is the usual cause when someone has edited one side — CFE's matching is
+exact.
+
+### `UnauthorizedOperation` on `ReplaceRoute`
+
+The route table has lost its `f5_cloud_failover_label` tag, or `cfeTag` was changed on one
+side only. The IAM policy conditions the write on the tag value matching `cfeTag` exactly.
+All three must agree: the tag on the route tables, the `cfeTag` parameter, and the value
+the BIG-IPs received in their `failoverTag` instance tag.
+
+### The stack fails at `AmiInfo`
+
+The `bigIpImage` name pattern matched no image in your Region. Re-run the image lookup in
+[step 4.6](#46-pre-flight-checks) and set a pattern that matches something available.
+
+### The stack fails at `SsmJump`
+
+Usually the Amazon Linux AMI SSM parameter is not published in your Region. Check it as in
+step 4.6 and pass your own image via `ssmJumpCustomImageId`.
+
+### The stack fails at `Network` with an unknown-parameter error
+
+Your bucket has an older copy of a shared module. The air-gap solution needs the updated
+`modules/network/network.yaml` and `modules/bigip-standalone/bigip-standalone.yaml`, not
+just the `failover-airgap/` directory. Re-run the `s3 sync` from
+[step 4.4](#44-stage-the-s3-bucket).
+
+### `Failover initialization failed` / `ECONNREFUSED` during onboarding
+
+A VPC endpoint problem. Check the interface endpoints exist, that their security group
+allows 443 from the VPC CIDR, and that the stack Region matches the bucket Region.
+
+### `Sync Failed` — "Static route gateway ... is not directly connected via an interface"
+
+The full error, seen on the active device:
+
+```
+Sync error on failover02.local: Load failed from /Common/failover01.local
+01070330:3: Static route gateway 10.0.0.1 is not directly connected via an interface.
+```
+
+Each BIG-IP's default route points at its **own** subnet's gateway, which differs per
+Availability Zone (`10.0.0.1` in AZ A, `10.0.4.1` in AZ B). That route lives in the
+`/LOCAL_ONLY` folder precisely so it is *not* synced. If the folder has been assigned to the
+sync device group, it syncs anyway and the peer rejects it.
+
+Check the folder, not the route:
+
+```bash
+tmsh list sys folder /LOCAL_ONLY
+```
+
+You want `device-group none` and `traffic-group traffic-group-local-only`. If it shows
+`device-group failoverGroup`, that is the fault. Fix it on the affected device:
+
+```bash
+tmsh modify sys folder /LOCAL_ONLY device-group none traffic-group traffic-group-local-only
+tmsh save sys config
+tmsh run cm config-sync to-group failoverGroup
+tmsh show cm sync-status
+```
+
+**Why it happens:** the clustering self-heal creates the device group out of band, because
+Declarative Onboarding's own clustering deadlocks on the documented device-trust startup
+bug. That out-of-band creation can leave `/LOCAL_ONLY` stamped with the new device group.
+Observed in lab on 2026-09-08: the *owner* device had `device-group failoverGroup` while
+its peer correctly had `none`, which fits the group being created on the owner. The
+self-heal now detects and corrects this on both devices.
+
+> ### ⚠️ Fixing the folder is not enough on its own — the status stays red
+> BIG-IP caches the last sync failure and only clears it after a **successful** load. So
+> after correcting the folder, the cluster still reports `Sync Failed` and it looks like the
+> fix did nothing. You must then force one clean load, **from the device that was the source
+> of the failed sync** — pushing from the peer does not clear it:
+>
+> ```bash
+> tmsh run cm config-sync force-full-load-push to-group failoverGroup
+> sleep 30
+> tmsh show cm sync-status
+> ```
+>
+> That push is safe once `/LOCAL_ONLY` is excluded on both devices, because the route can no
+> longer be carried. Confirmed in lab 2026-09-09: folder corrected on both devices, then one
+> push from the source device, and the cluster went green and stayed there.
+
+**Confirming it is stale rather than live.** If you are unsure whether a red status reflects
+an ongoing failure or a cached one, two checks settle it:
+
+```bash
+grep -rnE '10\.0\.0\.1([^0-9]|$)' /config/bigip.conf /config/bigip_base.conf /config/partitions/*/bigip.conf
+grep -i '01070330' /var/log/ltm
+```
+
+Substitute the gateway from your own error. The sync payload is built from those config
+files, so if the address appears **only** in `/config/partitions/LOCAL_ONLY/bigip.conf`,
+nothing syncable references it and the payload cannot carry it. If `/var/log/ltm` has no
+matching entries — check whether they are only in the rotated `ltm.1` — then nothing has
+failed recently and the status is simply stale.
+
+**Note that failover keeps working while this is broken**, because network failover and
+CFE's route updates do not depend on config-sync. What stops is configuration propagation
+between the devices, so the pair drifts silently. Treat a red sync status as urgent even
+though traffic looks healthy.
+
+### Clustering fails, config-sync breaks, or AWS calls are rejected as expired
+
+Check the clock first: `date` on both devices, and `tmsh list sys ntp`. This solution has no
+internet egress, so NTP **must** be the link-local Amazon Time Sync address
+`169.254.169.123`. If someone has reverted it to `pool.ntp.org`, time sync fails silently
+and the drift eventually breaks device trust, config-sync, and SigV4 request signing (AWS
+rejects signatures outside a ~15-minute window, which surfaces as puzzling auth errors from
+CFE).
+
+### `Sending telemetry failed: ECONNREFUSED 35.199.173.84:443`
+
+**Harmless.** That is F5's usage-telemetry phone-home being correctly blocked by the air
+gap. It does not affect failover. You can silence it by disabling telemetry in the
+runtime-init configuration if the log noise is unwelcome.
+
+### Clustering never completes
+
+**First, give it time.** [Section 4.10](#410-what-the-self-heal-is-doing-during-those-2530-minutes)
+explains what is happening; builds that hit the device-trust bug need a reboot and retry
+cycle and can take 40+ minutes. Let the full 50-minute timeout elapse.
+
+**Then read the narration** — `/config/cluster-heal/log` on **both** devices. The last line
+names the phase it is in. Common outcomes:
+
+| What the log says | What it means |
+|---|---|
+| `cfn-signal failed` | The BIG-IP cannot reach CloudFormation. Check the interface endpoint exists and `curl -sk --max-time 10 https://cloudformation.<region>.amazonaws.com/` returns a number, not `000`. |
+| `add-to-trust … No route to host` | Harmless, right after the reboot — the metadata service is not up yet. The next 3-minute tick retries automatically. |
+| `Root STILL missing >4min after reboot` | The self-heal exhausted its attempts. Use the manual recovery below. |
+| `add-to-trust attempted 6x` | Same — manual recovery below. |
+
+**Re-arm the self-heal** after manual changes:
+
+```bash
+rm -f /config/cluster-heal/done /config/cluster-heal/signalled
+echo '*/3 * * * * root /config/cluster-heal.sh >/dev/null 2>&1' > /etc/cron.d/cluster-heal
+```
+
+or just run `/config/cluster-heal.sh` by hand.
+
+<details>
+<summary><b>Manual clustering recovery</b> — the fallback when the self-heal gives up (click to expand)</summary>
+
+Symptom: `tmsh show cm sync-status` reports `Status: Unknown`, `Summary: no trust domain`,
+`Mode: standalone`, and `tmsh list cm trust-domain` is empty.
+
+Device trust and config-sync run over the **external Self IP** network — the management
+interface is not used for clustering. Substitute your own admin password and Self IPs.
+
+**1. Reboot BOTH devices.** A clean boot lets `devmgmtd` rebuild the `Root` trust domain.
+Runtime-init is one-shot and will not re-run its failed clustering:
+
+```bash
+tmsh reboot
+```
+
+**2. Once both are back, confirm `Root` exists on each:**
+
+```bash
+tmsh list cm trust-domain one-line
+```
+
+**3. On failover02**, add failover01 over its **external** Self IP (not management):
+
+```bash
+tmsh modify cm trust-domain Root ca-devices add { 10.0.0.11 } \
+  name failover01.local username admin password '<admin-password>'
+```
+
+`tmsh list cm trust-domain one-line` should now show both devices as `initialized`.
+
+**4. On failover01**, create the device group and sync:
+
+```bash
+tmsh create cm device-group failoverGroup type sync-failover
+tmsh modify cm device-group failoverGroup devices add { failover01.local failover02.local }
+tmsh modify cm device-group failoverGroup auto-sync enabled network-failover enabled
+tmsh modify sys folder /LOCAL_ONLY device-group none traffic-group traffic-group-local-only
+tmsh save sys config
+tmsh run cm config-sync to-group failoverGroup
+```
+
+The `/LOCAL_ONLY` line is not optional — without it the per-AZ default route syncs to the
+peer and the cluster lands in `Sync Failed`
+([see above](#sync-failed--static-route-gateway--is-not-directly-connected-via-an-interface)).
+
+If it stays `Changes Pending` or `Awaiting Initial Sync`, force the initial push from the
+device holding the authoritative config:
+
+```bash
+tmsh run cm config-sync force-full-load-push to-group failoverGroup
+```
+
+**5. Verify on both devices** — expect `Status: In Sync` (green), `Mode: high-availability`:
+
+```bash
+tmsh show cm sync-status
+```
+
+</details>
+
+### The two devices ended up with different admin passwords
+
+If trust never forms and `curl -sku admin:'<pw>' https://<peer-mgmt>/mgmt/tm/sys/version`
+returns `200` on one device and `401` on the other, the secret was changed between the two
+instances launching, so they resolved different values. Use a stable secret — create it
+yourself and pass `bigIpSecretArn` rather than letting the stack generate one — and
+redeploy.
+
+### A command with multiple IDs fails with `Invalid...ID.NotFound`
+
+If you are on zsh (the macOS default), an unquoted variable holding several
+space-separated IDs is passed as **one** argument rather than split into several. Write the
+IDs out literally, or use a zsh array: `RTBS=(rtb-aaa rtb-bbb)`.
+
+---
+
+## See also
+
+- [README.md](README.md) — parameter and output reference for this template
+- [MAINTAINING.md](MAINTAINING.md) — how this directory relates to `examples/failover`
+- [`examples/failover/GOVCLOUD-GUIDE.md`](../failover/GOVCLOUD-GUIDE.md) — the *other*
+  solution in this repository: the EIP-based failover pair. Not required for anything in
+  this guide
+- [F5 Cloud Failover Extension documentation](https://clouddocs.f5.com/products/extensions/f5-cloud-failover/latest/userguide/aws.html)

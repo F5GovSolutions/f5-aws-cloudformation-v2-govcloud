@@ -26,22 +26,31 @@ VIP prefix that targets the active BIG-IP's external interface, and CFE retarget
 routes (`failoverRoutes`) when the active device changes. Every AWS API call the BIG-IPs
 make is served by a VPC endpoint.
 
-> **Status: scaffolded, not yet lab-validated.** The templates lint clean and follow the
-> CFE documentation, but the route-based failover path has not been deployed end to end in
-> GovCloud yet. Validate in both failover directions before this appears in a customer
-> design. See [AIRGAP-GUIDE.md](AIRGAP-GUIDE.md) for the validation procedure.
+> ### ✅ Status: lab-validated
+> Deployed and failover-tested end to end in `us-gov-east-1` on **2026-09-08** (3-NIC PAYG,
+> BIG-IP 17.5.1.6-0.0.25, CFE 2.4.0). VIP failover was verified in **both** directions and
+> converged in **6-10 seconds**, measured from an in-VPC client at a 0.5 s poll interval
+> (individual runs: 9.58 s, ~6 s, 9.58 s). Run-to-run variance is real. Quote 10 seconds for
+> headroom, and measure in your own environment before committing to an RTO.
+>
+> **➡️ New here? Start with [AIRGAP-GUIDE.md](AIRGAP-GUIDE.md)** - a complete step-by-step
+> deployment walkthrough with architecture diagrams, Session Manager and GUI access, a
+> validation checklist and troubleshooting. This README is the parameter and output
+> reference.
 
 ## What is different from `examples/failover`
 
 | | `examples/failover` | `examples/failover-airgap` |
 |---|---|---|
-| Elastic IPs | Up to 5 (management, external Self IPs, VIP) | **None** |
+| Elastic IPs | Up to 5 (management, external Self IPs, VIP) **plus 2 for NAT gateways** | **None at all** |
 | Application VIP | Secondary private IP per AZ + one floating EIP | **One address outside the VPC CIDR** (`externalVipAddress`) |
 | What CFE moves on failover | The EIP association (`failoverAddresses`) | **The target ENI of the VIP route** in every route table (`failoverRoutes`) |
 | Source/dest check on external ENIs | Enabled (AWS default) | **Disabled** (required for an alien-IP VIP) |
 | Route tables | Untagged | Tagged `f5_cloud_failover_label=cfeTag`, one VIP route each |
 | VPC endpoints | Optional (`provisionS3Endpoint`) | **Always** (S3, EC2, Secrets Manager, CloudFormation), plus SSM, SSM Messages and EC2 Messages when `provisionSsmAccess=true` |
 | Management access | Public EIP (eval) or bastion | **Session Manager** through a private jump host (`provisionSsmAccess`, default); public bastion only as a fallback (`provisionBastion`) |
+| NAT gateways | 2 (one per AZ), each with an Elastic IP, giving the private subnets a `0.0.0.0/0` route to the internet | **None** (`provisionNatGateways='false'`). No default route out of the private subnets |
+| DNS / NTP | VPC resolver / `pool.ntp.org` (needs egress) | VPC resolver / **Amazon Time Sync `169.254.169.123`** - both link-local, no egress |
 | Public-IP toggles | 4 parameters | Removed - fixed to none |
 
 **Demo responder.** With `provisionExampleApp=false` (the default) the VIP's pool has no
@@ -57,13 +66,15 @@ fail over. Route-based failover sidesteps addressing entirely.
 
 ## Prerequisites
 
-Identical to the GovCloud prerequisites in
-[`examples/failover/GOVCLOUD-GUIDE.md`](../failover/GOVCLOUD-GUIDE.md) sections 1-8: an S3
-bucket in the deployment Region holding the modules, this directory, the BIG-IP extension
-RPMs and the runtime-init installer, all readable by the BIG-IPs; an SSH key pair; an
-admin-password secret; a BIG-IP marketplace image available in the Region.
+An S3 bucket in the deployment Region holding the modules, this directory, the BIG-IP
+extension RPMs and the runtime-init installer, all readable by the BIG-IPs; an SSH key pair;
+an admin-password secret; and a BIG-IP marketplace image available in the Region.
 
-In addition:
+**[AIRGAP-GUIDE.md sections 3 and 4](AIRGAP-GUIDE.md#3-before-you-start) walk through every
+one of those with commands** - it is self-contained, so you do not need any other document
+to get a working stack.
+
+Points specific to this solution:
 
 - **Choose the VIP prefix carefully.** `externalVipCidr` (default `10.99.0.0/24`) must not
   overlap the VPC CIDR or anything reachable from the VPC - including on-premises ranges
@@ -89,6 +100,8 @@ The parameters are those of `failover.yaml` **minus** the public-IP toggles
 | `externalVipAddress` | No | `10.99.0.100` | The application VIP. Must be outside the VPC CIDR and inside `externalVipCidr`. Bound to the AS3 virtual servers on both devices. |
 | `externalVipCidr` | No | `10.99.0.0/24` | Prefix routed to the active BIG-IP. One `AWS::EC2::Route` for exactly this prefix is created per route table, and the CFE declaration manages routes for exactly this prefix. |
 | `provisionSsmAccess` | No | `true` | Deploy a private jump host managed by Systems Manager Session Manager (`modules/ssm-jump`) in the BIG-IP management subnet, plus the SSM interface endpoints. No public IP, no inbound rules, no SSH key. |
+| `ssmJumpInstanceType` | No | `t3.micro` | Instance type for the jump host. It only terminates SSM sessions and forwards ports, so the smallest type in the Region is normally enough. |
+| `ssmJumpCustomImageId` | No | `''` | AMI for the jump host, overriding the Amazon Linux 2023 lookup. Leave empty for the normal case. Set it if the AWS-published SSM parameter `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64` is not available in your Region, or if a hardened base image is required. Any image works provided the SSM Agent is installed and starts at boot. |
 | `provisionBastion` | No | `false` | Fallback only: deploy the Linux bastion (`modules/bastion`) in the first external subnet **with a public IP** and SSH open to `restrictedSrcAddressMgmt`. |
 
 See `failover-airgap-parameters.json` for a complete example parameter set.
@@ -109,11 +122,21 @@ See `failover-airgap-parameters.json` for a complete example parameter set.
 
 ## Deploying this Solution
 
-Stage the bucket exactly as in the GovCloud guide, with this directory included:
+**For a full walkthrough - prerequisites, the Session Manager plugin, staging the bucket,
+pre-flight checks, GUI access and validation - see
+[AIRGAP-GUIDE.md](AIRGAP-GUIDE.md#4-step-by-step-deployment).** The condensed form follows.
+
+Stage the bucket exactly as in the GovCloud guide, with this directory included. Note that
+the air-gap solution also depends on the shared `modules/network`, `modules/bigip-standalone`
+and `modules/ssm-jump` templates, so sync the whole `examples/` tree, not just this
+directory:
 
 ```bash
 aws s3 sync examples/ "s3://${BUCKET}/f5-aws-cloudformation-v2/v3.6.0.0/examples/" --region "${REGION}"
 ```
+
+> Never add `--delete` - the runtime-init installer and the three extension RPMs live only
+> in the bucket, not in this repo, and would be removed.
 
 Then:
 
@@ -130,22 +153,47 @@ and `restrictedSrcAddressApp` in the parameters file first.
 
 ## Validation
 
-[AIRGAP-GUIDE.md](AIRGAP-GUIDE.md) has the full procedure. The short form: paste the
-`ssmPortForwardBigIp01` output into a terminal, open `https://localhost:8443`, then on the
-active device:
+[AIRGAP-GUIDE.md](AIRGAP-GUIDE.md#6-validating-the-deployment) has the full checklist. The
+short form - paste the `ssmPortForwardBigIp01` output into a terminal, open
+`https://localhost:8443`, then:
 
 ```bash
-# CFE must list the VIP route - "routes" must NOT be empty
-curl -sku admin:"${PW}" https://localhost/mgmt/shared/cloud-failover/inspect | python3 -m json.tool
+# CFE must list the VIP route - "routes" must NOT be empty.
+# "addresses" being empty is correct: this design has no EIPs to move.
+curl -sku admin:"${PW}" https://localhost:8443/mgmt/shared/cloud-failover/inspect | python3 -m json.tool
 
-# Fail over, then watch the route target flip to the peer's ENI
+# Every next-hop item MUST be a bare address - a "/24" here breaks failover in one
+# direction while still reporting success. See AIRGAP-GUIDE.md troubleshooting.
+curl -sku admin:"${PW}" https://localhost:8443/mgmt/shared/cloud-failover/declare \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["declaration"]["failoverRoutes"]["routeGroupDefinitions"][0]["defaultNextHopAddresses"]["items"])'
+
+# Then fail over from the ACTIVE device and watch the route target flip to the peer's ENI.
+# Test BOTH directions - a fault can exist in only one.
 tmsh run sys failover standby
 ```
 
+> **Monitoring note.** CFE reports `taskState: SUCCEEDED` / `Failover Complete` even when
+> it performs zero route operations, and `inspect` still looks healthy. Production health
+> checks must compare the **actual route target** against the **actual active device**,
+> not CFE's own status.
+
 ## Deleting this Solution
 
-As for `examples/failover`: empty the CFE S3 bucket, then delete the stack. The VIP routes
-are stack resources and are removed with it even though CFE has changed their target.
+Empty the CFE state bucket first - CloudFormation cannot delete a bucket that still has
+objects in it, and the delete fails partway if you skip this. The VIP routes are stack
+resources and are removed with the stack even though CFE has changed their target.
+
+```bash
+CFEB=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+  --query "Stacks[0].Outputs[?OutputKey=='cfeS3Bucket'].OutputValue" --output text)
+aws s3 rm "s3://$CFEB" --recursive
+aws cloudformation delete-stack --stack-name "$STACK"
+aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+```
+
+Full procedure, including what to check for stranded resources and what to do when the
+delete fails, is in
+[AIRGAP-GUIDE.md section 10](AIRGAP-GUIDE.md#10-tearing-the-stack-down).
 
 ## Maintaining
 

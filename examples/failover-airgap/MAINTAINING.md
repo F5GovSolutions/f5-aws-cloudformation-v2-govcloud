@@ -5,14 +5,28 @@ It exists so that the air-gap path (no Elastic IPs, route-based VIP failover) ca
 built and validated without touching the working EIP-based path. The price of that is
 duplication, and this file is what keeps the two from drifting.
 
+## Validation record
+
+| | |
+|---|---|
+| **Validated** | 2026-09-08, `us-gov-east-1` |
+| **Build** | 3-NIC PAYG, BIG-IP 17.5.1.6-0.0.25, DO 1.47.0, AS3 3.56.0, CFE 2.4.0 |
+| **Result** | Deployed end to end; VIP failover verified in **both** directions |
+| **Convergence** | 6-10 s each way (in-VPC client, 0.5 s poll, last-good to first-good; runs: 9.58 s / ~6 s / 9.58 s) |
+| **Defects found and fixed** | (1) Masked next-hop address broke failover in one direction - see "Rules that are easy to break" below. (2) `cfeS3Bucket` was never passed to `BigIpInstance02`, so its CFE could not reach the state store during onboarding - an upstream bug, also fixed in `examples/failover/failover.yaml`. (3) NAT gateways and two Elastic IPs were created in what was documented as a no-public-IP design, giving the private subnets internet egress - now `provisionNatGateways='false'`, with NTP moved to link-local. (4) `/LOCAL_ONLY` was assigned to the sync device group on the owner device, syncing a per-AZ default route to a peer that rejected it and leaving the cluster permanently `Sync Failed`. |
+
+Re-run the [validation checklist](AIRGAP-GUIDE.md#6-validating-the-deployment) and both
+failover directions after any change to the CFE declaration, the network module's route
+table tagging, or the `externalSelfIp` / `peerExternalSelfIp` instance tags.
+
 ## What is shared, what is forked
 
 | Component | Status | Notes |
 |---|---|---|
-| `modules/network/network.yaml` | **Shared** | Gains two optional parameters, both default-off: `routeTableFailoverTag` (tags every route table `f5_cloud_failover_label=<value>`; this template passes `cfeTag`) and `provisionSsmEndpoints` (adds the `ssm`, `ssmmessages`, `ec2messages` interface endpoints). The endpoint security group's condition widened to "S3 endpoints **or** SSM endpoints". With the defaults the module behaves exactly as before. |
+| `modules/network/network.yaml` | **Shared** | Gains two optional parameters, both default-off: `routeTableFailoverTag` (tags every route table `f5_cloud_failover_label=<value>`; this template passes `cfeTag`) `provisionSsmEndpoints` (adds the `ssm`, `ssmmessages`, `ec2messages` interface endpoints), and `provisionNatGateways` (default `true` = historical behaviour; `false` removes the NAT gateways, their Elastic IPs and the `0.0.0.0/0` route from the private route tables, leaving the route tables themselves - and therefore the VPC endpoint associations and VIP routes - intact). The endpoint security group's condition widened to "S3 endpoints **or** SSM endpoints". With the defaults the module behaves exactly as before. |
 | `modules/access/access.yaml` | **Shared, unchanged** | `solutionType: failover` selects `BigIpHighAvailabilityAccessRole`, which already grants `ec2:ReplaceRoute`, `ec2:CreateRoute` and `ec2:DescribeRouteTables`. The write actions are conditioned on the route table carrying `f5_cloud_failover_label` = `cfeTag`, which is why the network tag above is mandatory. |
 | `modules/dag/dag.yaml` | **Shared, unchanged** | Called with `numberPublicExternalIpAddresses=0` and `numberPublicMgmtIpAddresses=0`, which creates no EIP resources at all. |
-| `modules/bigip-standalone/bigip-standalone.yaml` | **Shared** | Gains four optional parameters (`disableSourceDestCheck`, `externalVipAddress`, `externalVipCidr`, `bigIpPeerExternalSelfIp`), three instance tags carrying the last three to runtime-init, and one output (`bigIpExternalInterfaceId`). All default to the previous behaviour. |
+| `modules/bigip-standalone/bigip-standalone.yaml` | **Shared** | Gains four optional parameters (`disableSourceDestCheck`, `externalVipAddress`, `externalVipCidr`, `bigIpPeerExternalSelfIp`), four instance tags carrying values to runtime-init (`externalVipAddress`, `externalVipCidr`, `peerExternalSelfIp`, and `externalSelfIp` - the last exposing the already-existing bare `externalSelfIp` parameter), and one output (`bigIpExternalInterfaceId`). All default to the previous behaviour. |
 | `modules/bastion/bastion.yaml` | **Shared, unchanged** | Fallback only (`provisionBastion`, default `false`). |
 | `modules/ssm-jump/ssm-jump.yaml` | **New** | Private Session Manager jump host: IAM role with `AmazonSSMManagedInstanceCore`, egress-only security group, IMDSv2-only launch template, Amazon Linux 2023 via the SSM public AMI parameter. Only this solution uses it so far; nothing about it is air-gap specific, so `examples/failover` could adopt it later. |
 | `modules/function`, `modules/application` | **Shared, unchanged** | |
@@ -34,13 +48,15 @@ diff examples/failover/failover.yaml examples/failover-airgap/failover-airgap.ya
   `provisionPublicIpExternalSelf`, `provisionExternalVip`, `provisionS3Endpoint`,
   `bigIpExternalVip01`, `bigIpExternalVip02`, `cfeVipTag`. Their values are fixed: no
   public IPs anywhere, no secondary private IPs, VPC endpoints always on.
-- **Added parameters:** `externalVipAddress`, `externalVipCidr`, `provisionSsmAccess`, `provisionBastion` (default `false` here).
+- **Added parameters:** `externalVipAddress`, `externalVipCidr`, `provisionSsmAccess`,
+  `provisionBastion` (default `false` here), `ssmJumpInstanceType`, `ssmJumpCustomImageId`.
 - **Instances:** `disableSourceDestCheck='true'`, the three VIP/peer parameters, all EIP
   allocation IDs `''`, `numExternalPublicIpAddresses=0`, `numSecondaryPrivateIpAddresses=0`,
   default runtime-init config URLs point at this directory.
 - **DAG:** both public-address counts `0`, `cfeVipTag=''`.
 - **Network:** `setPublicSubnet1='false'`, `provisionS3Endpoint='true'`,
-  `provisionSsmEndpoints` from `provisionSsmAccess`, `routeTableFailoverTag=cfeTag`.
+  `provisionSsmEndpoints` from `provisionSsmAccess`, `routeTableFailoverTag=cfeTag`,
+  `provisionNatGateways='false'` (no NAT gateways, no Elastic IPs, no egress).
 - **New resources:** `SsmJump` nested stack; `VipRoutePublic`, `VipRoutePrivateA`,
   `VipRoutePrivateB` - `AWS::EC2::Route` entries for `externalVipCidr` targeting instance
   A's external ENI.
@@ -53,13 +69,21 @@ Each config is the corresponding `-with-app.yaml` file plus:
 
 1. `failoverRoutes` in the CFE declaration (`routeGroupDefinitions`, discovered by
    `f5_cloud_failover_label`, `scopingAddressRanges` = `externalVipCidr`, static next hops =
-   both external Self IPs).
+   both external Self IPs), and `failoverAddresses` set to `enabled: false` - there are no
+   EIPs and no secondary private IPs here, so address failover has nothing to relocate and
+   only adds empty-result noise to `restnoded.log`. This is the one CFE difference that
+   inverts the source file rather than adding to it.
 2. One AS3 `Service_Address` on the alien VIP in the default (floating) traffic group,
    instead of two per-AZ addresses with `trafficGroup: none`. Two services (HTTP, HTTPS)
    instead of four.
-3. Three tag-sourced `runtime_parameters`: `EXTERNAL_VIP_ADDRESS`, `EXTERNAL_VIP_CIDR`,
-   `PEER_SELF_IP_EXTERNAL`.
-4. A `Demo_Responder` iRule in `Shared`, attached to both services. It only acts when the
+3. Four tag-sourced `runtime_parameters`: `EXTERNAL_VIP_ADDRESS`, `EXTERNAL_VIP_CIDR`,
+   `OWN_SELF_IP_EXTERNAL`, `PEER_SELF_IP_EXTERNAL`.
+4. NTP set to the Amazon Time Sync Service (`169.254.169.123`) instead of `pool.ntp.org`.
+   With `provisionNatGateways='false'` there is no route to the internet, so public NTP
+   would silently fail - and clock skew breaks device trust, config-sync and SigV4 request
+   signing. DNS was already the link-local VPC resolver (`169.254.169.253`), so it needed
+   no change.
+5. A `Demo_Responder` iRule in `Shared`, attached to both services. It only acts when the
    pool has no active members. Nothing about it is air-gap specific; `examples/failover`
    could adopt it, in which case keep the two copies identical.
 
@@ -80,6 +104,48 @@ editing `cluster-heal.sh`, regenerate it in **both** directories.
 - **The route-table tag is load-bearing twice.** CFE discovers route tables by it, and
   IAM denies `ReplaceRoute` on a table without it. Do not make `routeTableFailoverTag`
   optional in this parent.
+- **CFE next-hop addresses must be bare - no `/mask`.** The `failoverRoutes` next-hop
+  list is matched against each device's own local addresses to decide which hop is
+  "mine". `10.0.0.11/24` never matches `10.0.0.11`, so the device whose address carries
+  the mask finds no next hop, performs **zero** route operations, and still reports
+  `taskState: SUCCEEDED` / `Failover Complete` - a silent no-op that looks healthy in
+  `inspect`. This is why the list uses the tag-sourced `OWN_SELF_IP_EXTERNAL` and not
+  `SELF_IP_EXTERNAL`: the latter comes from AWS metadata with a mask because the DO
+  `SelfIp` class requires one. Lab-observed 2026-09-08: it broke failover in one
+  direction only, because the CFE declaration is config-synced, so both devices shared
+  one list and only the device named by the masked entry failed to match.
+
+- **Both instances must receive `cfeS3Bucket`.** Upstream `failover.yaml` passed it only to
+  `BigIpInstance01`; `BigIpInstance02` fell back to the module default `''`, so its
+  `cfeStorageName` tag rendered as `.s3.<region>.amazonaws.com` and CFE failed every state
+  read with `getaddrinfo ENOTFOUND`. Config-sync eventually repairs the declaration from the
+  peer, which is why this stayed hidden - but during onboarding, exactly when instance 02 may
+  become active first, its CFE is dead. Lab-observed 2026-09-08: a fresh stack reached
+  `CREATE_COMPLETE` with the VIP black-holed. Fixed in both parents; keep them symmetric.
+
+- **`/LOCAL_ONLY` must never belong to the sync device group.** It holds the default route,
+  whose gateway is the device's own subnet gateway and therefore differs per AZ. Assigned to
+  `failoverGroup`, that route syncs and the peer rejects it
+  (`01070330:3: Static route gateway ... is not directly connected`), leaving the cluster
+  permanently `Sync Failed` while failover itself keeps working - so it is easy to miss.
+  Creating the device group out of band, which `cluster-heal.sh` must do, can leave the
+  folder stamped with it; the script now corrects this on every device. Lab-observed
+  2026-09-08 on the owner device only, its peer being correct - consistent with the group
+  being created on the owner. The correct state is `device-group none` and
+  `traffic-group traffic-group-local-only`. **Root cause confirmed 2026-09-09:** with the
+  folder corrected on both devices, the only remaining occurrence of the offending gateway
+  was `/config/partitions/LOCAL_ONLY/bigip.conf`, which is not syncable - and one
+  `force-full-load-push` from the source device cleared the status to In Sync. Note that
+  BIG-IP caches the last failure, so the status stays red until a successful load; fixing
+  the folder alone looks like it changed nothing.
+
+- **Nothing in the private subnets may need internet egress.** `provisionNatGateways='false'`
+  removes the default route entirely. Everything the solution needs is reachable without it:
+  S3 artifacts via the gateway endpoint, AWS APIs via interface endpoints, DNS and NTP via
+  link-local addresses. Anything added later that expects egress - notably
+  `provisionExampleApp='true'`, which pulls a container image - will fail. Re-enable NAT
+  deliberately if that is required, and accept that it reintroduces two Elastic IPs.
+
 - **Source/dest check** is disabled through the ENI resource, so it survives reboots and
   redeploys. Do not replace it with a post-deploy script.
 - **Shared-module parameters must keep defaults that preserve existing behaviour.** The
@@ -87,8 +153,10 @@ editing `cluster-heal.sh`, regenerate it in **both** directories.
 
 ## Converging later
 
-If the air-gap path proves out, the right long-term shape is probably a mode parameter on
-`examples/failover/failover.yaml` rather than two parents. Build that from this directory
-once the route-based path has been lab-validated in both failover directions and its
-convergence time measured; the list above is the change set that parameter would have
-to switch.
+The air-gap path has now proved out (see the validation record above), so the right
+long-term shape is probably a mode parameter on `examples/failover/failover.yaml` rather
+than two parents. The change set above is what that parameter would have to switch. The
+main open question is whether the EIP-based and route-based paths can share one set of
+runtime-init configs, or whether the CFE declaration differences (`failoverAddresses` vs
+`failoverRoutes`, and the next-hop list) make two files the clearer option even inside a
+merged parent.
