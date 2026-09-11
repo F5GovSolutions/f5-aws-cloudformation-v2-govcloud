@@ -37,7 +37,7 @@
   },
   {
     "ParameterKey": "bigIpImage",
-    "ParameterValue": "*17.5.1.6-0.0.25*PAYG-Best Plus 25Mbps*"
+    "ParameterValue": "*17.5.1.9-0.0.12*PAYG-Best Plus 25Mbps*"
   },
   {
     "ParameterKey": "bigIpInstanceProfile",

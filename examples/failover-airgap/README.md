@@ -12,6 +12,11 @@
 - [Deleting this Solution](#deleting-this-solution)
 - [Maintaining](#maintaining)
 
+See also **[TEMPLATE-MAP.md](TEMPLATE-MAP.md)** — a dependency map that traces how each value
+gets from a CloudFormation parameter to a running BIG-IP object, with exact `file:line`
+references. Read that when you want to know *why* something works or where a value comes from;
+read [AIRGAP-GUIDE.md](AIRGAP-GUIDE.md) when you want to deploy it.
+
 ## Introduction
 
 This parent template deploys the same BIG-IP active/standby pair as
@@ -37,6 +42,12 @@ make is served by a VPC endpoint.
 > deployment walkthrough with architecture diagrams, Session Manager and GUI access, a
 > validation checklist and troubleshooting. This README is the parameter and output
 > reference.
+> **Note the image change.** The default is now **BIG-IP 17.5.1.9-0.0.12, Best Plus 25Mbps** —
+> the same bundle and throughput as the validated build, one patch newer. It was moved off
+> 17.5.1.6 because a defect in that release scopes the admin user to the `Common` partition:
+> `tmsh` lists the AS3-created application objects normally, but the GUI shows nothing under
+> `Tenant_1`. **17.5.1.9 was confirmed to carry the fix.** See the guide's troubleshooting
+> section for the check and the workaround that applies to any version.
 
 ## What is different from `examples/failover`
 
@@ -67,8 +78,17 @@ fail over. Route-based failover sidesteps addressing entirely.
 ## Prerequisites
 
 An S3 bucket in the deployment Region holding the modules, this directory, the BIG-IP
-extension RPMs and the runtime-init installer, all readable by the BIG-IPs; an SSH key pair;
-an admin-password secret; and a BIG-IP marketplace image available in the Region.
+extension RPMs, the runtime-init installer and its `gpg.key`, all readable by the BIG-IPs;
+an SSH key pair; an admin-password secret; and a BIG-IP marketplace image available in the
+Region.
+
+> `gpg.key` is easy to miss and its absence is fatal. The runtime-init installer verifies
+> its own RPM against a key it fetches from `f5-cft.s3.amazonaws.com` - a **commercial**
+> partition bucket, unreachable from an air-gapped GovCloud VPC. This template therefore
+> passes `--key <your bucket>/gpg.key` to the installer, so you must stage the key
+> alongside the `.gz.run`. Without it the BIG-IPs never onboard, the admin password is
+> never set, and the stack times out after ~50 minutes. See
+> [AIRGAP-GUIDE.md section 4.4](AIRGAP-GUIDE.md#44-stage-the-s3-bucket).
 
 **[AIRGAP-GUIDE.md sections 3 and 4](AIRGAP-GUIDE.md#3-before-you-start) walk through every
 one of those with commands** - it is self-contained, so you do not need any other document
@@ -102,7 +122,13 @@ The parameters are those of `failover.yaml` **minus** the public-IP toggles
 | `provisionSsmAccess` | No | `true` | Deploy a private jump host managed by Systems Manager Session Manager (`modules/ssm-jump`) in the BIG-IP management subnet, plus the SSM interface endpoints. No public IP, no inbound rules, no SSH key. |
 | `ssmJumpInstanceType` | No | `t3.micro` | Instance type for the jump host. It only terminates SSM sessions and forwards ports, so the smallest type in the Region is normally enough. |
 | `ssmJumpCustomImageId` | No | `''` | AMI for the jump host, overriding the Amazon Linux 2023 lookup. Leave empty for the normal case. Set it if the AWS-published SSM parameter `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64` is not available in your Region, or if a hardened base image is required. Any image works provided the SSM Agent is installed and starts at boot. |
+| `bigIpRuntimeInitGpgKeyUrl` | No | `''` | **Leave blank.** Blank auto-derives `<s3BucketName>.s3.<s3BucketRegion>.amazonaws.com/<artifactLocation>gpg.key`. Set it only to serve the key from elsewhere. This is the GPG public key the runtime-init installer verifies its own RPM against - a separate download from the installer package that F5 hard-codes to a **commercial-partition** bucket, unreachable from an air-gapped GovCloud VPC and fatal when it fails. Either way `gpg.key` must be staged in the bucket and anonymously readable; `s3 sync` does not copy it. |
 | `provisionBastion` | No | `false` | Fallback only: deploy the Linux bastion (`modules/bastion`) in the first external subnet **with a public IP** and SSH open to `restrictedSrcAddressMgmt`. |
+
+> There is no parent parameter for the installer flags themselves. The parent assembles
+> `--skip-toolchain-metadata-sync --key <the URL above>` and passes it to each BIG-IP as the
+> `bigIpRuntimeInitInstallerFlags` parameter of `modules/bigip-standalone`. That module
+> parameter defaults to `''`, so `examples/failover` and the other examples are unaffected.
 
 See `failover-airgap-parameters.json` for a complete example parameter set.
 
@@ -135,8 +161,8 @@ directory:
 aws s3 sync examples/ "s3://${BUCKET}/f5-aws-cloudformation-v2/v3.6.0.0/examples/" --region "${REGION}"
 ```
 
-> Never add `--delete` - the runtime-init installer and the three extension RPMs live only
-> in the bucket, not in this repo, and would be removed.
+> Never add `--delete` - the runtime-init installer, its `gpg.key` and the three extension
+> RPMs live only in the bucket, not in this repo, and would be removed.
 
 Then:
 

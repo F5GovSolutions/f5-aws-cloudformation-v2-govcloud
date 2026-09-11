@@ -193,10 +193,14 @@ Conditions:
     - !Equals
       - !Ref 'instanceProfile'
       - ""
-  createCfeS3Bucket: !Not
+  createCfeS3Bucket: !And
+    - !Not
+      - !Equals
+        - !Ref 'cfeS3Bucket'
+        - ''
     - !Equals
-      - !Ref 'cfeS3Bucket'
-      - ''
+      - !Ref 'provisionCfeS3Bucket'
+      - 'true'
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -205,6 +209,7 @@ Metadata:
         Parameters:
           - bigIpRuntimeInitConfig
           - bigIpRuntimeInitPackageUrl
+          - bigIpRuntimeInitInstallerFlags
           - hostname
           - bigIpPeerHostname
           - licenseKey
@@ -265,10 +270,14 @@ Metadata:
         default: Runtime Init Configuration
       bigIpRuntimeInitPackageUrl:
         default: Runtime Init Package
+      bigIpRuntimeInitInstallerFlags:
+        default: Runtime Init Installer Flags
       cost:
         default: Cost Center
       cfeS3Bucket:
         default: S3 bucket used as BIGIP storage for Failover solution
+      provisionCfeS3Bucket:
+        default: Create the Failover S3 bucket in this stack
       cfeTag:
         default: CFE Deployment tag value
       imageId:
@@ -434,11 +443,37 @@ Parameters:
     Default: 'https://cdn.f5.com/product/cloudsolutions/f5-bigip-runtime-init/v2.0.3/dist/f5-bigip-runtime-init-2.0.3-1.gz.run'
     Description: URL for BIG-IP Runtime Init package.
     Type: String
+  bigIpRuntimeInitInstallerFlags:
+    Default: ''
+    Description: 'OPTIONAL - Extra command line flags passed to the f5-bigip-runtime-init
+      self-extracting installer (install_rpm.sh) at boot. Leave empty for the normal
+      internet-connected behaviour. Air-gapped deployments need this because the
+      installer independently fetches two things from the public internet that are
+      NOT covered by bigIpRuntimeInitPackageUrl: (1) the GPG public key used to verify
+      the RPM signature, hard-coded to https://f5-cft.s3.amazonaws.com/... which is a
+      COMMERCIAL partition bucket and therefore unreachable from a GovCloud VPC with no
+      internet egress, and (2) the automation toolchain metadata index. Failure to fetch
+      the GPG key is FATAL - the installer loops on it and onboarding never starts.
+      Typical air-gap value:
+      "--skip-toolchain-metadata-sync --key https://<bucket>.s3.<region>.amazonaws.com/<prefix>/gpg.key"
+      which keeps RPM signature verification intact by pointing at a locally staged copy
+      of the same key. Use --skip-verify instead only if you accept an unverified RPM.'
+    Type: String
   cfeS3Bucket:
     Description: Supply a unique name for a CFE S3 bucket created and used by Cloud
       Failover Extension.
     Type: String
     Default: ''
+  provisionCfeS3Bucket:
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: 'Whether THIS stack creates the S3 bucket named by cfeS3Bucket. Both
+      devices in a Cloud Failover pair need the bucket NAME - runtime-init reads it from an
+      instance tag to build the CFE storage endpoint - but only ONE of them may create the
+      bucket, because two stacks creating the same BucketName in parallel is an error. Set
+      this to false on the second device of a pair, leaving cfeS3Bucket populated so its tag
+      is still correct. Default true, which is what a standalone deployment wants.'
+    Type: String
   cfeTag:
     Description: Cloud Failover deployment tag value.
     Type: String
@@ -512,6 +547,15 @@ Parameters:
     Description: Prefix, outside the VPC CIDR and containing externalVipAddress, that is
       routed to the active BIG-IP for route-based VIP failover. Exposed to runtime-init
       as the externalVipCidr instance tag. Leave empty when not using route-based failover.
+    Type: String
+  artifactBaseUrl:
+    Default: ''
+    Description: 'OPTIONAL - base URL of the staging bucket prefix, with a trailing slash, e.g.
+      https://my-bucket.s3.us-gov-east-1.amazonaws.com/f5-aws-cloudformation-v2/v3.6.0.0/examples/
+      Exposed to runtime-init as the artifactBaseUrl instance tag so a runtime-init config can
+      build its extensionUrl values from it instead of hard-coding a bucket name. Leave empty
+      when the runtime-init config carries absolute URLs, which is the case for every example
+      other than failover-airgap.'
     Type: String
   externalSubnetId:
     Default: ''
@@ -1223,6 +1267,8 @@ Resources:
           Value: !Ref 'externalVipAddress'
         - Key: externalVipCidr
           Value: !Ref 'externalVipCidr'
+        - Key: artifactBaseUrl
+          Value: !Ref 'artifactBaseUrl'
         - Key: externalSelfIp
           Value: !Ref 'externalSelfIp'
         - Key: peerExternalSelfIp
@@ -1364,6 +1410,10 @@ Resources:
             - !Ref 'allowUsageAnalytics'
             - |
               '
+            - INSTALLER_FLAGS='
+            - !Ref 'bigIpRuntimeInitInstallerFlags'
+            - |
+              '
             - |
               echo ${SECRET_ID} > /config/cloud/secret_id
             - |
@@ -1401,7 +1451,7 @@ Resources:
             - |
               # Run
             - |
-              bash "/var/config/rest/downloads/${PACKAGE_URL##*/}" -- '--cloud aws --telemetry-params templateName:v3.6.0.0/examples/modules/bigip-standalone/bigip-standalone.yaml'
+              bash "/var/config/rest/downloads/${PACKAGE_URL##*/}" -- "--cloud aws${INSTALLER_FLAGS:+ ${INSTALLER_FLAGS}} --telemetry-params templateName:v3.6.0.0/examples/modules/bigip-standalone/bigip-standalone.yaml"
             - |2+
 
             - |
@@ -1491,6 +1541,8 @@ Resources:
           Value: !Ref 'externalVipAddress'
         - Key: externalVipCidr
           Value: !Ref 'externalVipCidr'
+        - Key: artifactBaseUrl
+          Value: !Ref 'artifactBaseUrl'
         - Key: externalSelfIp
           Value: !Ref 'externalSelfIp'
         - Key: peerExternalSelfIp
@@ -1632,6 +1684,10 @@ Resources:
             - !Ref 'allowUsageAnalytics'
             - |
               '
+            - INSTALLER_FLAGS='
+            - !Ref 'bigIpRuntimeInitInstallerFlags'
+            - |
+              '
             - |
               echo $SECRET_ID > /config/cloud/secret_id
             - |
@@ -1669,7 +1725,7 @@ Resources:
             - |
               # Run
             - |
-              bash "/var/config/rest/downloads/${PACKAGE_URL##*/}" -- '--cloud aws --telemetry-params templateName:v3.6.0.0/examples/modules/bigip-standalone/bigip-standalone.yaml'
+              bash "/var/config/rest/downloads/${PACKAGE_URL##*/}" -- "--cloud aws${INSTALLER_FLAGS:+ ${INSTALLER_FLAGS}} --telemetry-params templateName:v3.6.0.0/examples/modules/bigip-standalone/bigip-standalone.yaml"
             - |2+
 
             - |
@@ -1753,6 +1809,8 @@ Resources:
           Value: !Ref 'externalVipAddress'
         - Key: externalVipCidr
           Value: !Ref 'externalVipCidr'
+        - Key: artifactBaseUrl
+          Value: !Ref 'artifactBaseUrl'
         - Key: externalSelfIp
           Value: !Ref 'externalSelfIp'
         - Key: peerExternalSelfIp
@@ -1894,6 +1952,10 @@ Resources:
             - !Ref 'allowUsageAnalytics'
             - |
               '
+            - INSTALLER_FLAGS='
+            - !Ref 'bigIpRuntimeInitInstallerFlags'
+            - |
+              '
             - |
               echo $SECRET_ID > /config/cloud/secret_id
             - |
@@ -1931,7 +1993,7 @@ Resources:
             - |
               # Run
             - |
-              bash "/var/config/rest/downloads/${PACKAGE_URL##*/}" -- '--cloud aws --telemetry-params templateName:v3.6.0.0/examples/modules/bigip-standalone/bigip-standalone.yaml'
+              bash "/var/config/rest/downloads/${PACKAGE_URL##*/}" -- "--cloud aws${INSTALLER_FLAGS:+ ${INSTALLER_FLAGS}} --telemetry-params templateName:v3.6.0.0/examples/modules/bigip-standalone/bigip-standalone.yaml"
             - |2+
 
             - |

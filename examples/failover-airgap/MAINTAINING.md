@@ -5,15 +5,76 @@ It exists so that the air-gap path (no Elastic IPs, route-based VIP failover) ca
 built and validated without touching the working EIP-based path. The price of that is
 duplication, and this file is what keeps the two from drifting.
 
+> **Before changing anything here, read [TEMPLATE-MAP.md](TEMPLATE-MAP.md).** It traces how
+> each value crosses from CloudFormation to the BIG-IP - via instance tags for small values,
+> S3 URLs for large ones - which is what most of the rules below are protecting.
+
 ## Validation record
 
 | | |
 |---|---|
-| **Validated** | 2026-09-08, `us-gov-east-1` |
+| **Validated** | 2026-09-08 (17.5.1.6), and 2026-09-10 on **17.5.1.9-0.0.12** with every fix active, `us-gov-east-1` |
 | **Build** | 3-NIC PAYG, BIG-IP 17.5.1.6-0.0.25, DO 1.47.0, AS3 3.56.0, CFE 2.4.0 |
+| **Default image now** | BIG-IP 17.5.1.9-0.0.12, Best Plus 25Mbps - one patch newer than validated, see note below |
 | **Result** | Deployed end to end; VIP failover verified in **both** directions |
-| **Convergence** | 6-10 s each way (in-VPC client, 0.5 s poll, last-good to first-good; runs: 9.58 s / ~6 s / 9.58 s) |
+| **Convergence, commanded** | 6-10 s each way (in-VPC client, 0.5 s poll, last-good to first-good; runs: 9.58 s / ~6 s / 9.58 s) |
+| **Convergence, automatic** | **12.6 s** - Active instance stopped with `aws ec2 stop-instances`, 2026-09-10, 17.5.1.9-0.0.12. Roughly double the commanded case: the survivor waits ~3 s of missed unicast heartbeats before declaring the peer down, which a commanded failover skips. **Quote this number, not the commanded one** - a customer's RTO has to survive an instance disappearing |
 | **Defects found and fixed** | (1) Masked next-hop address broke failover in one direction - see "Rules that are easy to break" below. (2) `cfeS3Bucket` was never passed to `BigIpInstance02`, so its CFE could not reach the state store during onboarding - an upstream bug, also fixed in `examples/failover/failover.yaml`. (3) NAT gateways and two Elastic IPs were created in what was documented as a no-public-IP design, giving the private subnets internet egress - now `provisionNatGateways='false'`, with NTP moved to link-local. (4) `/LOCAL_ONLY` was assigned to the sync device group on the owner device, syncing a per-AZ default route to a peer that rejected it and leaving the cluster permanently `Sync Failed`. |
+
+**Rejoin after an instance stop needs a manual config-sync.** Verified 2026-09-10: the restarted
+device returns `Changes Pending` on `datasync-global-dg`, not `In Sync`, and `autoSync` does not
+resolve it - both devices advanced their commit ids while apart, so BIG-IP reports a possible
+change conflict and asks for a direction rather than guessing. Follow the recommendation, which
+names the source device and the group: in the verified run the source was the device that had
+been STOPPED, not the survivor that stayed up and took Active, which is the opposite of the
+intuitive answer. `cluster-heal.sh` handles this case during a build but has removed its own cron
+by then, so post-deployment this is manual - see the guide's section 9.
+
+**Automatic failover and rejoin verified 2026-09-10** for the first time. Every earlier
+measurement was a commanded failover, which skips detection entirely and therefore does not
+represent an instance being lost. Stopping the Active instance moved the VIP in 12.6 s
+(21:35:17.87 last good -> 21:35:30.48 first good, 8 failed polls between). Measure this by
+timestamp, never by counting poll iterations: a tick is `sleep` plus however long `curl` takes,
+and a black-holed route burns the full timeout while a refused connection fails instantly - the
+same 8 ticks would read as 4 s or 20 s depending on which.
+
+**2026-09-10 build** confirmed, in one deployment, every fix working together: runtime-init
+installed from the staged `gpg.key`, DO applied with link-local NTP and DNS, device trust and
+`failoverGroup` formed, config-sync `In Sync`, `/LOCAL_ONLY` excluded from the sync group, CFE
+carrying bare next-hop addresses, the CFE state bucket named and reachable on both devices, and
+the VIP following the active device in both directions. Two further defects were found and
+fixed reaching it - see "Vendor installers" below for both.
+
+Note that on a clean build `/LOCAL_ONLY` reports `device-group none` with `traffic-group none`;
+only `device-group` matters. The self-heal sets `traffic-group-local-only` when it has to
+correct the folder, so either value is healthy.
+
+**Image version changed 2026-09-10, after the validation above.** `bigIpImage` now defaults to
+`*17.5.1.9-0.0.12*PAYG-Best Plus 25Mbps*` - the same bundle and throughput as the validated
+build, one patch newer.
+
+BIG-IP 17.5.1.6 scopes the admin user created by Declarative Onboarding to the `Common`
+partition. `tmsh` lists the AS3-created objects normally, because a root shell does not honour
+partition access, but the GUI shows nothing under `Tenant_1` - so a working deployment looks
+empty to anyone inspecting it through TMUI.
+
+A larger jump to 21.1.0.2 was considered and rejected. The concern driving it was that 17.5.x
+might no longer publish a `Best` PAYG bundle; a marketplace query disproved that - every 17.5.x
+build offers `PAYG-Best Plus` at all throughputs. With that gone, a patch bump inside the
+validated minor is the far smaller risk: the extension version and `extensionHash` pins, the
+`cluster-heal.sh` workaround (which targets a 17.x device-trust bug) and the observed self-heal
+timing all stay in known territory.
+
+**Two things are still open on this pin:**
+
+- **17.5.1.9 carries the partition-access fix - confirmed 2026-09-10.** Both devices reported
+  `partition-access { all-partitions { role admin } }` with no intervention, against
+  `Common` on 17.5.1.6. The version-independent fix, should it ever recur, is `partitionAccess`
+  on the DO User class - see the troubleshooting entry in the guide. It is deliberately not
+  applied by default: DO rejects an unrecognised property outright, so an unsupported spelling
+  fails onboarding rather than being ignored, and that costs a build cycle to discover.
+- **17.5.1.9 has not been through the validation checklist.** Everything recorded above was
+  measured on 17.5.1.6.
 
 Re-run the [validation checklist](AIRGAP-GUIDE.md#6-validating-the-deployment) and both
 failover directions after any change to the CFE declaration, the network module's route
@@ -145,6 +206,119 @@ editing `cluster-heal.sh`, regenerate it in **both** directories.
   link-local addresses. Anything added later that expects egress - notably
   `provisionExampleApp='true'`, which pulls a container image - will fail. Re-enable NAT
   deliberately if that is required, and accept that it reintroduces two Elastic IPs.
+
+- **Vendor installers have egress dependencies that reading our templates will not reveal.**
+  Found the hard way on 2026-09-09, the first clean build after NAT was removed. Serving
+  `f5-bigip-runtime-init-2.0.3-1.gz.run` from the bucket is not sufficient: `install_rpm.sh`
+  *inside* the self-extracting archive independently fetches
+  `https://f5-cft.s3.amazonaws.com/f5-bigip-runtime-init/gpg.key` to verify the RPM
+  signature, and separately syncs an automation-toolchain metadata index. The GPG fetch is
+  **fatal and retries indefinitely**; NAT had been silently covering for it. Symptom: BIG-IP
+  prompt still reads `ip-10-0-1-11` (default hostname) after 20+ minutes, no
+  `/var/log/f5-bigip-runtime-init.log`, admin password rejected, stack times out. The error
+  is only in `/var/log/cloud/startup-script.log`.
+
+  Handled by `bigIpRuntimeInitInstallerFlags` on `modules/bigip-standalone`, which the
+  air-gap parent sets to `--skip-toolchain-metadata-sync --key <bucket>/gpg.key`. The
+  parameter defaults to `''` and the flags are appended **unquoted** after the existing
+  single-quoted argument, so an empty value expands to no argument at all and the userdata
+  for every other example is byte-identical to before. Verified by rendering the `Fn::Join`
+  for all three NIC variants with and without flags and diffing.
+
+  To inspect the installer yourself: `bash <the>.gz.run --noexec --target /var/tmp/rti`
+  extracts it without running it. Worth repeating whenever the pinned runtime-init version
+  changes - a new release could add or move a bootstrap fetch.
+
+- **Flags for the runtime-init installer must go INSIDE the single argument, not after it.**
+  The invocation in `modules/bigip-standalone` userdata is:
+
+  ```
+  bash "...gz.run" -- "--cloud aws --telemetry-params ...${INSTALLER_FLAGS:+ ${INSTALLER_FLAGS}}"
+  ```
+
+  The first attempt appended the flags as separate shell words *after* the quoted argument.
+  That renders correctly, passes `bash -n`, and does not work. Proven on a live instance:
+  the userdata contained a correct `--key https://<bucket>/gpg.key` and `install_rpm.sh`
+  still reported its default commercial-partition key location and looped on the
+  unreachable fetch.
+
+  The reason shows up in the argv shape. Appended outside the quotes the words land in
+  `argv[3..5]`; makeself forwards the first argument after `--` to the embedded setup
+  script, so nothing past `argv[2]` is ever seen. Every flag that does work today -
+  `--cloud`, `--telemetry-params` - is inside that one argument.
+
+  `${VAR:+ $VAR}` supplies the joining space only when the value is non-empty, so an empty
+  value reproduces the original argument byte-for-byte and the other examples are
+  unaffected.
+
+  **The lesson generalises:** rendering the right text is not evidence that an argument is
+  received. When adding a flag here, prove the argv shape rather than reading the line -
+  a stub is enough:
+
+  ```bash
+  cat > /tmp/fakerun <<'EOF'
+  #!/bin/bash
+  i=0; for a in "$@"; do i=$((i+1)); printf 'argv[%d]=[%s]\n' "$i" "$a"; done
+  EOF
+  chmod +x /tmp/fakerun
+  # then run the emitted command with /tmp/fakerun substituted for the .gz.run
+  ```
+
+- **The `_ha_cgc` certificate error is NOT sufficient to break a cluster.** Measured 2026-09-10
+  on a build that reached `In Sync` unaided and stayed healthy: the owner logged **8**
+  `_ha_cgc ... cannot load key/cert/chain` errors, `disc_ticks` and `tmm_restarted` were never
+  created, and config-sync came up on its own. TMM evidently reloads the profiles successfully
+  later in some runs. This is why the self-heal's restart is gated on `Disconnected` persisting
+  rather than on the log signature - had it been gated on the error, that healthy pair would have
+  had TMM restarted for no reason. Treat the error as a corroborating detail, never as a
+  diagnosis.
+
+- **Whether the trust exchange survives depends on the reboots being simultaneous.** Both builds
+  on 2026-09-10 hit the Root-missing path and rebooted. In the failing one only the OWNER rebooted
+  at 19:48 while the joiner was already past that stage and POSTed `add-to-trust` into the window
+  where `restjavad` was still starting - half-completing the exchange and leaving asymmetric
+  trust. In the successful one BOTH devices rebooted within a second of each other at 20:42, came
+  back together, and the joiner's first attempt at 20:51 returned OK. The pre-reboot uptime guard
+  (600s) is what tends to align them, since both instances launch at nearly the same moment; a
+  device that boots slower than its peer is the case to worry about.
+
+- **The clustering self-heal has no branch for "the channel is down".** Found 2026-09-10 on a
+  17.5.1.9 build. `cluster-heal.sh` polls two states - trust formed, and In Sync - and logs a
+  reassuring message every three minutes in either. When the config-sync channel itself fails to
+  establish, the two devices settle into a split brain that satisfies neither exit condition:
+  the owner logs "failoverGroup exists, waiting for In Sync" while the peer logs "trust formed;
+  waiting for owner to create failoverGroup", indefinitely. The build is unrecoverable but looks
+  like it is still progressing, so the 50-minute timeout is the first signal anything is wrong.
+
+  The underlying fault was a race in TMOS, not in our templates: TMM loaded the `_ha_cgc_*` SSL
+  profiles for the HA channel ten seconds before `installAuthorityTrust` finished writing the
+  device-trust certificates, failed with "cannot load key/cert/chain", and never retried.
+  Everything downstream - trust records, device group membership, configsync-ip, self-IP
+  allow-service - completed correctly, so every configuration check passes and only
+  `/var/log/ltm` shows the cause. Restarting TMM on the affected device recovers it.
+
+  **Implemented 2026-09-10** as step 4a-bis in `cluster-heal.sh`. Note what the field evidence
+  forced: the restart is NOT gated on the log signature, because only ONE of the two devices
+  logged the `_ha_cgc` error yet BOTH needed the restart before config-sync recovered. Gating on
+  the error would have missed the device that needed it most. It is gated instead on
+  `Disconnected` persisting for three consecutive ticks - cron runs every 3 minutes, so roughly
+  9 minutes, well inside the 50-minute stack timeout - and marker-gated so it happens at most
+  once. The `/var/log/ltm` check is retained for the log message only. A tick counter resets
+  whenever sync recovers, so a transient disconnect during normal formation cannot accumulate
+  toward a restart.
+
+  Verified before shipping: `bash -n` and `shellcheck` clean with no new findings versus HEAD
+  (the two pre-existing SC1083/SC2086 on the `tmsh ... devices add { $DEVS }` line are
+  intentional tmsh syntax); the branch logic exercised against five scenarios with a stubbed
+  `tmsh` - cert error present, cert error absent, healthy, escalation after restart, and counter
+  reset on recovery; the grep pattern matched against the verbatim log line from the failed
+  build; and the regenerated base64 decoded byte-identically to the source in all four config
+  files, with the `cluster-heal-trust.py` blob confirmed unchanged. The install command itself
+  was extracted from the parsed YAML and executed in a sandbox, confirming it writes the file
+  with mode 700 and the correct checksum.
+
+  Whether the race is specific to 17.5.1.9 is unknown; it is a startup ordering problem and could
+  plausibly occur on 17.5.1.6 too. It did not appear in any 17.5.1.6 build we ran.
 
 - **Source/dest check** is disabled through the ENI resource, so it survives reboots and
   redeploys. Do not replace it with a post-deploy script.

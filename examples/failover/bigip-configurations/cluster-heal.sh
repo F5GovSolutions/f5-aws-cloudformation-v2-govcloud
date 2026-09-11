@@ -19,6 +19,10 @@
 #          -> cluster-heal-trust.py: fetch admin password (Secrets Manager, SigV4 via
 #             instance role) and POST /mgmt/tm/cm/add-to-trust to the peer.
 #        - OWNER (remoteHost is a /Common path) -> wait for the joiner.
+#        - a peer that is unreachable (rebooting) does NOT consume a retry; a peer that
+#          reports it is already trusted while we are not is ASYMMETRIC -> stop and say so.
+#   4a-bis. trust formed but config-sync stays Disconnected (TMM failed to load the
+#        device-trust cert chain for the _ha_cgc HA profiles) -> restart TMM ONCE.
 #   4b. trust formed -> elected owner (alphabetically-first device) creates failoverGroup
 #        + force-syncs (plain tmsh, no password); each device acts on any
 #        "Synchronize <me> to group X" recommendation (covers datasync-global-dg).
@@ -91,16 +95,138 @@ if [ "${NTRUST:-0}" -lt 2 ]; then
     exit 0
   fi
   PEERNAME=$(grep -oE '[A-Za-z0-9_-]+\.local' "$RTILOG" 2>/dev/null | sort -u | grep -vx "$MYHOST" | head -1)
+  # Asymmetric trust, detected on a previous tick. The peer has us in ITS trust domain while we
+  # do not have it in ours, so add-to-trust returns "already part of a trust-domain" forever and
+  # no number of retries can resolve it. Stop, and say so, rather than burning the retry budget
+  # and then falling silent. Lab-observed 2026-09-10.
+  if [ -f "$S/asym" ]; then
+    echo "ASYMMETRIC TRUST: peer has this device in its trust-domain but this device has only itself."
+    echo "Retrying cannot fix this - device trust must be reset. See the air-gap guide troubleshooting."
+    exit 0
+  fi
+
   T=$(cat "$S/trust_tries" 2>/dev/null || echo 0)
   if [ "$T" -ge 6 ]; then
     echo "add-to-trust attempted ${T}x, trust still not formed - manual recovery needed (see GOVCLOUD-GUIDE.md)"
     exit 0
   fi
-  echo $((T+1)) > "$S/trust_tries"
   echo "JOINER -> add-to-trust peer=${PEERIP} name=${PEERNAME} (attempt $((T+1)))"
-  python3 /config/cluster-heal-trust.py "$PEERIP" "$PEERNAME"
+
+  # Capture the helper's output so the outcome can be classified. It always prints one line:
+  # either "... OK: ..." or "... HTTP <code>: <body>".
+  TRUSTOUT=$(python3 /config/cluster-heal-trust.py "$PEERIP" "$PEERNAME" 2>&1)
+  echo "$TRUSTOUT"
+
+  case "$TRUSTOUT" in
+    *"already part of a trust-domain"*)
+      # The peer belongs to a trust domain we are not in. Half-completed exchange - see above.
+      touch "$S/asym"
+      echo "peer reports it is already in a trust-domain while we are not -> ASYMMETRIC, marking and stopping"
+      ;;
+    *"iControl session"*|*"Connection refused"*|*"timed out"*|*"URLError"*|*"HTTP 50"*)
+      # The peer was unreachable rather than unwilling - it is most likely rebooting, which this
+      # same script does to the OWNER when Root is missing. Do NOT count this as an attempt: the
+      # original failure came from a joiner exhausting its budget against a peer that was simply
+      # down for six minutes.
+      echo "peer unreachable (rebooting or REST not up yet) - NOT counting this as a trust attempt"
+      ;;
+    *)
+      echo $((T+1)) > "$S/trust_tries"
+      ;;
+  esac
+
   echo "add-to-trust attempt complete; re-check next tick"
   exit 0
+fi
+
+# 4a-bis. Trust is formed but the config-sync channel will not come up.
+# Lab-observed 2026-09-10: TMM loads the _ha_cgc_clientssl / _ha_cgc_serverssl profiles - the
+# SSL profiles for the HA config-sync channel - while installAuthorityTrust is still writing
+# the device-trust certificates, fails with "cannot load key/cert/chain", and never retries.
+# iQuery then opens a TCP connection to the peer and has no usable TLS, so every configuration
+# check passes (trust formed, configsync-ip correct, port 4353 reachable) while no session ever
+# forms. Both devices go Active, and the two waiting states below - "waiting for owner" on the
+# peer and "waiting for In Sync" on the owner - never terminate.
+#
+# Restarting TMM makes it re-read the completed chain. The restart is NOT gated on the log
+# signature: in the observed case only ONE device logged the _ha_cgc error, yet both needed the
+# restart before config-sync recovered. The log check is diagnostic only. Gated instead on
+# Disconnected persisting for several consecutive ticks, so a transient disconnect during normal
+# cluster formation does not trigger it, and marker-gated so it happens at most once.
+# "Disconnected" is what sync-status reports when the iQuery session between the devices is not
+# established. It appears on BOTH devices, whichever mode they are in (high-availability on the
+# owner, sync-only on a peer that has no failover device group yet), so this one test covers both.
+if tmsh show cm sync-status 2>/dev/null | grep -qi "disconnected"; then
+
+  # Count CONSECUTIVE disconnected ticks in a file, because each cron run is a separate process
+  # and cannot remember the last one. The counter is deleted the moment sync is healthy (see the
+  # else branch at the bottom), so this only ever counts an unbroken run of failures.
+  DISC=$(cat "$S/disc_ticks" 2>/dev/null || echo 0)
+
+  # Defensive: if the counter file is empty or somehow not a number, treat it as 0. Without this,
+  # $((DISC + 1)) below would abort the script under "set -u" / arithmetic errors and the
+  # self-heal would stop running entirely. '*[!0-9]*' matches any string containing a non-digit.
+  case "$DISC" in ''|*[!0-9]*) DISC=0 ;; esac
+
+  DISC=$((DISC + 1))
+  echo "$DISC" > "$S/disc_ticks"
+
+  # Diagnostic only - this does NOT decide whether to restart. The certificate error is the known
+  # cause, but in the observed failure only one of the two devices logged it while both needed the
+  # restart, so gating on it would skip the device that needs it most. Logging it either way tells
+  # whoever reads this log afterwards which device hit the certificate race.
+  # Look at the tail first, so a failure that is still happening is distinguished from one that
+  # happened at boot and may already have been dealt with. Scanning the whole file unconditionally
+  # made every tick after a TMM restart still claim a certificate failure, which reads as though
+  # the restart achieved nothing.
+  if tail -n 500 /var/log/ltm 2>/dev/null | grep -q '_ha_cgc.*cannot load key/cert/chain'; then
+    echo "config-sync Disconnected (tick ${DISC}); TMM cert load failure (_ha_cgc) in the RECENT log"
+  elif grep -q '_ha_cgc.*cannot load key/cert/chain' /var/log/ltm 2>/dev/null; then
+    echo "config-sync Disconnected (tick ${DISC}); _ha_cgc cert failure logged EARLIER this boot (may predate a restart)"
+  else
+    echo "config-sync Disconnected (tick ${DISC}); no _ha_cgc cert error logged on this device"
+  fi
+
+  # Restart TMM once, after 3 consecutive disconnected ticks. Cron runs this script every 3
+  # minutes, so 3 ticks is roughly 9 minutes - long enough that a brief disconnect during normal
+  # cluster formation is never mistaken for this fault, and short enough to leave plenty of room
+  # inside the stack's 50-minute CreationPolicy timeout for the cluster to form afterwards.
+  #
+  # Restarting TMM interrupts data plane traffic. That is acceptable here and only here: this
+  # branch is reached only when the cluster has never synced, which means the pair is not yet
+  # serving a working HA configuration anyway.
+  if [ "$DISC" -ge 3 ] && [ ! -f "$S/tmm_restarted" ]; then
+    echo "Disconnected for ${DISC} consecutive ticks -> restarting TMM once to rebuild the HA SSL profiles"
+
+    # Write the marker BEFORE restarting, not after. Restarting TMM can kill this script mid-run;
+    # if the marker were written afterwards it might never be written at all, and every subsequent
+    # tick would restart TMM again - an endless restart loop that would be far worse than the
+    # deadlock this is fixing.
+    touch "$S/tmm_restarted"
+
+    tmsh restart sys service tmm >/dev/null 2>&1
+
+    # Stop here rather than falling through to the group-creation logic below. TMM takes up to a
+    # minute to come back, and any tmsh command issued in the meantime would act on an
+    # inconsistent view of the system. The next cron tick re-evaluates from the top.
+    echo "TMM restart issued; re-checking next tick"
+    exit 0
+  fi
+
+  # Three more ticks (about 9 further minutes) after the restart with no improvement means this is
+  # not the certificate race, or not only that. Say so plainly instead of continuing to log a
+  # reassuring "waiting for In Sync" - that silence is exactly what made the original failure take
+  # an hour to spot. Deliberately does NOT exit: the steps below are harmless and may still help.
+  if [ "$DISC" -ge 6 ] && [ -f "$S/tmm_restarted" ]; then
+    echo "STILL Disconnected after a TMM restart - manual recovery needed; see the air-gap guide,"
+    echo "troubleshooting: 'Both devices are Active and Disconnected, and the self-heal loops forever'"
+  fi
+
+else
+  # Sync is not Disconnected, so any previous run of failures is over. Clearing the counter is what
+  # makes the threshold above mean "3 consecutive", not "3 in total since boot" - without this, a
+  # few unrelated blips over a long uptime would eventually add up and restart TMM on a healthy pair.
+  rm -f "$S/disc_ticks"
 fi
 
 # 4b. Trust formed. Ensure failoverGroup + sync via plain tmsh (no password).
