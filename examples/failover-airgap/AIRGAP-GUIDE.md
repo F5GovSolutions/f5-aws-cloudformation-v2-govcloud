@@ -143,7 +143,7 @@ reachable without one:
 | Piece | What it is | Why it is here |
 |---|---|---|
 | **BIG-IP pair** | Two VEs, 3 NICs each (management, external, internal), clustered active/standby | The HA pair serving your application |
-| **Application VIP** `10.99.0.100` | An address **outside the VPC CIDR** | It belongs to no subnet, so it can be routed to either AZ — this is the whole trick |
+| **Application VIP** `10.99.0.100` | An **alien IP** — an address deliberately **outside the VPC CIDR** | It belongs to no subnet, so it can be routed to either AZ — this is the whole trick |
 | **Route tables** | Three, each with a route for `10.99.0.0/24` and tagged `f5_cloud_failover_label` | How clients reach the VIP, and what moves on failover |
 | **Cloud Failover Extension (CFE)** | An F5 extension running on each BIG-IP | On failover it calls `ec2:ReplaceRoute` to re-point those routes |
 | **Declarative Onboarding (DO)** | F5 extension | Builds the cluster, VLANs and Self IPs at first boot |
@@ -177,9 +177,22 @@ and **the VIP silently never moves**. That is the problem this template solves.
 
 ### What this template does instead
 
-The VIP is an address outside the VPC CIDR, so AWS has no implicit route for it. The
-template creates one in every route table, pointing at the active BIG-IP's external
-interface. On failover, CFE re-points them.
+The VIP is an **alien IP** — F5's term, also used in AWS material, for an address that is
+deliberately chosen *outside* the VPC CIDR so it belongs to no subnet and is nobody's ENI
+address. AWS therefore has no implicit route for it. The template creates one in every route
+table, pointing at the active BIG-IP's external interface, and on failover CFE re-points them.
+
+> **Why "alien" is the useful word here.** Because the address is foreign to every subnet,
+> nothing has to *move* it — no ENI reassignment, no Elastic IP association, no secondary
+> private IP that cannot cross an Availability Zone boundary. Only a route changes. Everything
+> else in this design follows from that one property, including the two things that surprise
+> people: source/destination checking must be **disabled** on the external ENIs (an alien IP is
+> never one of the ENI's own addresses, so AWS would otherwise discard the packet before the
+> BIG-IP sees it), and the whole alien prefix fails over together rather than one VIP at a time.
+
+In this guide, the parameters that define it are `externalVipCidr` (the **alien prefix**) and
+`externalVipAddress` (the **alien VIP** inside it). The names are historical; the concept is the
+alien IP.
 
 ```mermaid
 sequenceDiagram
@@ -344,10 +357,11 @@ session-manager-plugin
   you are fine. In a fully disconnected enclave with no AWS API access at all, Session
   Manager cannot help and you would need private connectivity (Direct Connect/VPN) instead.
 
-### 3.3 Choosing your VIP prefix
+### 3.3 Choosing your alien prefix
 
-`externalVipCidr` (default `10.99.0.0/24`) and `externalVipAddress` (default
-`10.99.0.100`) need thought before you deploy:
+This is the **alien IP** range — see [section 2](#what-this-template-does-instead) if the term
+is new. `externalVipCidr` (default `10.99.0.0/24`) is the alien prefix and `externalVipAddress`
+(default `10.99.0.100`) is the alien VIP inside it. Both need thought before you deploy:
 
 - The prefix **must not overlap** the VPC CIDR, any peered VPC, or any on-premises range
   reachable over Direct Connect, VPN or Transit Gateway. It is routed *inside* this VPC,
@@ -659,6 +673,19 @@ done
 `.run`, `gpg.key` or an `.rpm` means it was never uploaded — none of them are part of
 `s3 sync`.
 
+> **What this check does and does not prove.** You just ran it 🖥️ WORKSTATION, over the
+> internet. `200` on every line proves the **bucket policy** is right. It does not prove that
+> anything **inside the VPC** can reach the bucket, and the BIG-IPs fetch these objects from
+> inside the VPC with no internet at all. The two paths are different, and the second one is
+> the one that actually matters at boot.
+>
+> There is no way to test the VPC path before deploying, because the jump host that would do
+> the testing is created *by* the stack. If a deployment fails with the BIG-IPs never
+> onboarding, see
+> [the artifacts were never fetched](#the-big-ips-never-fetched-their-artifacts) — it explains
+> how to run this same check from inside the VPC, and the one parameter you need to set to make
+> that possible.
+
 ### 4.6 Pre-flight checks
 
 Three checks that fail *cheaply* now instead of expensively mid-deploy.
@@ -781,6 +808,23 @@ cd "$(git rev-parse --show-toplevel)"
 
 It is a plain JSON list of `ParameterKey` / `ParameterValue` pairs. Change only the values.
 
+> **You do not upload this file.** Unlike the templates, the parameters file is read from
+> your **local clone** — the `--parameters file://...` argument in section 4.8 is a local
+> path, resolved by the AWS CLI on your workstation before the API call is made. Nothing in
+> S3 and nothing on the BIG-IPs ever reads it. Edit it and launch; there is no `s3 sync` or
+> `s3 cp` step for this file.
+>
+> The one thing that trips people up: the section 4.4 `aws s3 sync ./examples/` does copy a
+> snapshot of this file into the bucket, because it lives under `examples/`. That copy is
+> inert — it is never fetched by anything. Do not go looking at it to check your values, and
+> do not be alarmed when it is out of date.
+
+> **Templates are the opposite**, and this is worth keeping straight because it is the more
+> common mistake in the other direction: if you edit `failover-airgap.yaml`, anything under
+> `modules/`, or a runtime-init config, you **must** re-run the section 4.4 `s3 sync` before
+> launching. CloudFormation and the BIG-IPs read those from the bucket, never from your
+> clone. Section 4.6's pre-flight check exists to catch exactly that.
+
 **Two parameters have no default — CloudFormation will not launch without them:**
 
 | Parameter | Value |
@@ -823,6 +867,7 @@ setting:
 | `bigIpInstanceProfile` | Creates a profile with the IAM permissions CFE needs |
 | `bigIpLicenseKey01` / `02` | Correct for PAYG, which is what the default `bigIpImage` is |
 | `ssmJumpCustomImageId` | Uses the current Amazon Linux 2023 AMI |
+| `ssmJumpS3PrefixListId` | The jump host cannot reach S3. Set it only if you want to verify bucket reachability from inside the VPC — see [troubleshooting](#the-big-ips-never-fetched-their-artifacts) |
 
 The console shows the same guidance: each of those descriptions now opens with
 `OPTIONAL - leave blank`.
@@ -830,6 +875,19 @@ The console shows the same guidance: each of those descriptions now opens with
 The full parameter reference is in [README.md](README.md#template-input-parameters).
 
 ### 4.8 Launch
+
+There are two ways to launch, and they produce an identical stack. Pick one:
+
+- **Option A — AWS CLI.** Uses the parameters file you just edited, so your values are
+  version-controlled and the launch is repeatable. Recommended if you expect to rebuild.
+- **Option B — AWS console (GUI).** You paste the template's S3 URL and type the parameters
+  into a form. Better if you are demonstrating the stack to someone, or if you would rather
+  read each parameter's description on screen than in a JSON file.
+
+Both read the **same template out of the same bucket**, so section 4.4 and section 4.5 must be
+done either way.
+
+#### Option A — launch from the CLI
 
 🖥️ WORKSTATION, **from the repository root** — `--parameters file://examples/...` is a relative
 path and fails from anywhere else:
@@ -848,6 +906,60 @@ aws cloudformation create-stack --region "$REGION" \
 > failed stack deletes its instances, taking the logs with it. `DO_NOTHING` preserves them
 > so you can get on the boxes and read what happened. You clean up manually afterwards.
 
+#### Option B — launch from the AWS console
+
+🖥️ WORKSTATION — **first, print the URL you are going to paste.** It is the same string
+`--template-url` uses above, and mistyping it is the most common reason this path fails:
+
+```bash
+echo "https://${BUCKET}.s3.${REGION}.amazonaws.com/${PREFIX}/failover-airgap/failover-airgap.yaml"
+```
+
+Copy that whole line of output. Then, in the AWS console:
+
+1. Switch the console to the **same Region as the bucket** (`us-gov-east-1` in this guide).
+   A template URL in another Region will not load.
+2. **CloudFormation → Stacks → Create stack → With new resources (standard)**.
+3. Under *Prepare template*, leave **Choose an existing template** selected.
+4. Under *Specify template*, choose **Amazon S3 URL** and paste the URL you just printed.
+5. **Next**, then give the stack a name — `failover-airgap` matches `$STACK` in this guide.
+6. Fill in the parameter form. The console renders one field per parameter with its
+   description, so section 4.7's table maps straight onto it. Set at minimum
+   `restrictedSrcAddressMgmt`, `restrictedSrcAddressApp`, `bigIpSecretArn`, `s3BucketName`,
+   `s3BucketRegion` and `artifactLocation`. **Leave the empty-string defaults empty** — they
+   are optional overrides, and their descriptions open with `OPTIONAL - leave blank`.
+7. **Next**. Under *Stack failure options*, choosing **Preserve successfully provisioned
+   resources** is the console equivalent of `--on-failure DO_NOTHING`, and is worth doing on a
+   first deployment for the same reason.
+8. **Next**, tick **I acknowledge that AWS CloudFormation might create IAM resources with
+   custom names** — this is the console equivalent of `--capabilities CAPABILITY_NAMED_IAM`,
+   and the stack cannot be created without it.
+9. **Submit**.
+
+> **Use the `https://` object URL, not the `s3://` one.** `s3://bucket/key` is the form
+> `aws s3 cp` takes; the console's *Amazon S3 URL* field wants the HTTPS object URL. If you
+> would rather copy it from the console than run the `echo` above, open the object in the S3
+> console and use its **Object URL** field — that is the same string.
+
+> **The console does not read `failover-airgap-parameters.json`.** There is no way to upload a
+> parameters file in the create-stack form, so the values are typed rather than loaded. Keep
+> the JSON file open beside the browser and use it as your checklist — especially for
+> `s3BucketName`, `s3BucketRegion` and `artifactLocation`, because those three are what the
+> parent template uses to build the URLs of its **nested** templates. If they are wrong, the
+> parent stack starts and then fails on the first nested stack with a template-not-found
+> error, which reads confusingly given the parent template obviously loaded.
+
+> **Labels move between console versions and Regions.** If your console offers
+> *Build from Infrastructure Composer* (formerly *Create template in Designer*) instead of the
+> wording above, ignore it — that is the visual template **authoring** tool. You are not
+> authoring a template here, you are launching one that already exists in your bucket, so the
+> field you want is always *Amazon S3 URL*.
+
+> **A private bucket is fine for this.** The console fetches the template with **your** IAM
+> credentials, not anonymously. The anonymous read access you set up in section 4.5 is for the
+> BIG-IPs fetching the installer and RPMs at boot — a different set of objects, and still
+> required whichever launch option you pick.
+
 ### 4.9 What to expect while it builds
 
 **`CREATE_IN_PROGRESS` for roughly 25–30 minutes is normal**, not a hang. BIG-IP has a
@@ -857,7 +969,9 @@ cluster out of band. The stack only signals success once the cluster is genuinel
 **In Sync**. The signal timeout is 50 minutes, after which a real failure surfaces as
 `CREATE_FAILED` rather than hanging forever.
 
-Watch progress:
+Watch progress. If you launched from the console you can watch the same thing in the stack's
+**Events** tab — it is the same data, just rendered; the CLI form below is handy because it
+filters out the noise of every `CREATE_IN_PROGRESS`:
 
 ```bash
 aws cloudformation describe-stack-events --region "$REGION" --stack-name "$STACK" \
@@ -1027,7 +1141,7 @@ Retrieve the password with:
 
 ```bash
 aws secretsmanager get-secret-value --region "$REGION" \
-  --secret-id <your-secret-arn> --query SecretString --output text
+  --secret-id '<your-secret-arn>' --query SecretString --output text
 ```
 
 **For the second BIG-IP**, use the `ssmPortForwardBigIp02` output, which forwards to
@@ -1097,7 +1211,7 @@ If those exist, the deployment is fine and you are looking at a navigation probl
 listing is genuinely empty, check whether AS3 deployed at all:
 
 ```bash
-curl -su admin:<password> http://localhost:8100/mgmt/shared/appsvcs/declare | python3 -m json.tool | head -40
+curl -su 'admin:<password>' http://localhost:8100/mgmt/shared/appsvcs/declare | python3 -m json.tool | head -40
 ```
 
 > ⚠️ **Treat AS3 objects as read-only in the GUI.** AS3 owns everything under `Tenant_1`.
@@ -1136,7 +1250,7 @@ it with:
 
 ```bash
 aws secretsmanager get-secret-value --region "$REGION" \
-  --secret-id <your-secret-arn> --query SecretString --output text
+  --secret-id '<your-secret-arn>' --query SecretString --output text
 ```
 
 > **If you left `bigIpSecretArn` blank**, the stack created the secret for you and publishes
@@ -1172,84 +1286,254 @@ ssh -p 2222 admin@localhost
 
 ## 6. Validating the deployment
 
-Run these after `CREATE_COMPLETE`, before testing failover. They confirm the five
-requirements from [section 2](#five-things-must-line-up) are actually in place.
+Run these after the stack reaches `CREATE_COMPLETE` and **before** testing failover. They
+confirm the five requirements from [section 2](#five-things-must-line-up) are actually in
+place. Checks 1 and 2 are the ones that catch a silently broken VIP, so do not skip them
+because the stack said `CREATE_COMPLETE` — it can and does.
 
-First collect the values you need:
+**Six checks, on two different machines.** Know which one you are typing on before you start
+(see [section 3.2](#32-three-machines--know-which-one-you-are-typing-on)):
+
+| Check | What it proves | Where you run it |
+|---|---|---|
+| 1 | Source/dest check is off, so AWS will deliver alien-IP packets | 🖥️ WORKSTATION |
+| 2 | Every route table is tagged and carries the alien prefix | 🖥️ WORKSTATION |
+| 3 | CFE found those route tables | 🔒 JUMP HOST |
+| 4 | CFE's next-hop addresses are in the form it can use | 🔒 JUMP HOST |
+| 5 | The active device and the route target agree | 🖥️ WORKSTATION + ⚙️ BIG-IP |
+| 6 | The VIP actually answers | 🔒 JUMP HOST |
+
+### 6.1 Collect the values — 🖥️ WORKSTATION
+
+Nothing below asks you to read an ID off a table and retype it. This block pulls every value
+the checks need straight out of the stack outputs. Run it from the same terminal where
+`REGION` and `STACK` are still set (section 4.1 — if you opened a new window, set them again):
 
 ```bash
-aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
-  --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
+# one call, reused for every lookup below
+OUT=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+  --query 'Stacks[0].Outputs' --output json)
+
+# helper: pull one output value out of that JSON by its key
+o() { printf '%s' "$OUT" | python3 -c \
+  "import sys,json; print(next((x['OutputValue'] for x in json.load(sys.stdin) if x['OutputKey']=='$1'), ''))"; }
+
+ENI01=$(o bigIpExternalInterfaceId01)   # instance A external interface — initial route target
+ENI02=$(o bigIpExternalInterfaceId02)   # instance B external interface
+MGMT01=$(o bigIpInstanceMgmtPrivateIp01)
+MGMT02=$(o bigIpInstanceMgmtPrivateIp02)
+VIP=$(o vipAddress)                     # e.g. 10.99.0.100
+VIPCIDR=$(o vipRouteCidr)               # e.g. 10.99.0.0/24  — the alien prefix
+JUMP=$(o ssmJumpInstanceId)
+
+# vipRouteTableIds is a COMMA-separated list; the CLI wants them space-separated
+RTBS=$(o vipRouteTableIds | tr ',' ' ')
+
+printf 'ENI01=%s\nENI02=%s\nMGMT01=%s\nMGMT02=%s\nVIP=%s\nVIPCIDR=%s\nRTBS=%s\nJUMP=%s\n' \
+  "$ENI01" "$ENI02" "$MGMT01" "$MGMT02" "$VIP" "$VIPCIDR" "$RTBS" "$JUMP"
 ```
 
-Note `bigIpExternalInterfaceId01/02`, `vipRouteTableIds`, `vipAddress` and
-`ssmJumpInstanceId` — the checks below use them. Substitute your own IDs for the examples.
+Every line of that output must have a value after the `=`. **A blank means the lookup failed**,
+almost always because `REGION` or `STACK` is wrong, or because the stack has not reached
+`CREATE_COMPLETE` yet — outputs do not populate until it does.
 
-**Check 1 — source/destination checking must be `False` on both external interfaces:**
+### 6.2 Check 1 — source/destination checking must be off — 🖥️ WORKSTATION
+
+This is the check that catches the most confusing possible failure. With source/dest checking
+on, AWS silently discards every packet destined for the VIP **before the BIG-IP sees it** — no
+log, no counter, no error anywhere. The stack looks perfect and the VIP simply never answers:
 
 ```bash
 aws ec2 describe-network-interfaces --region "$REGION" \
-  --network-interface-ids eni-AAAA eni-BBBB \
+  --network-interface-ids "$ENI01" "$ENI02" \
   --query 'NetworkInterfaces[].[NetworkInterfaceId,SourceDestCheck]' --output table
 ```
 
-**Check 2 — every route table tagged, and carrying the VIP route:**
+```
+----------------------------------------
+|       DescribeNetworkInterfaces      |
++-------------------------+------------+
+|  eni-0a1b2c3d4e5f6a7b8  |  False     |
+|  eni-0b2c3d4e5f6a7b8c9  |  False     |
++-------------------------+------------+
+```
+
+> **`False` is the passing answer here**, which reads backwards the first time you see it.
+> The column is "is the check enabled", and you need it **disabled**. `True` on either row
+> means that device cannot serve the VIP. See
+> [troubleshooting](#the-vip-does-not-answer-at-all).
+
+### 6.3 Check 2 — every route table tagged, and carrying the alien prefix — 🖥️ WORKSTATION
 
 ```bash
+# $RTBS is deliberately UNQUOTED: it holds several IDs that must
+# arrive as separate arguments, not as one string
 aws ec2 describe-route-tables --region "$REGION" \
-  --route-table-ids rtb-AAAA rtb-BBBB rtb-CCCC \
-  --query "RouteTables[].[RouteTableId,Tags[?Key=='f5_cloud_failover_label'].Value|[0],Routes[?DestinationCidrBlock=='10.99.0.0/24'].NetworkInterfaceId|[0]]" \
+  --route-table-ids $RTBS \
+  --query "RouteTables[].[RouteTableId,Tags[?Key=='f5_cloud_failover_label'].Value|[0],Routes[?DestinationCidrBlock=='${VIPCIDR}'].NetworkInterfaceId|[0]]" \
   --output table
 ```
 
-All three rows should show the tag value (`bigip_high_availability_solution` by default)
-and the **same** external interface ID — instance A's, since the template points them
-there initially.
+Three things must be true of that table:
 
-**Check 3 — CFE has discovered the routes.** From a jump host shell:
+1. **One row per route table** — three of them in the default two-AZ build.
+2. **The middle column is populated on every row** (`bigip_high_availability_solution` by
+   default). `None` there means the table is not tagged, so CFE will not manage it and that
+   subnet's traffic will not follow a failover. This is the `cfeTag` parameter.
+3. **The right-hand column shows the same interface ID on every row**, and it matches
+   `$ENI01` — instance A's external interface, where the template points the routes initially.
+
+`None` in the right-hand column means no route exists for the alien prefix in that table — the
+CLI prints `None`, not an empty cell, for a value it did not find. If the tag column is `None`
+instead, the table exists but was never tagged. Either way, see
+[troubleshooting](#the-vip-does-not-answer-at-all).
+
+### 6.4 Get onto the jump host — 🔒 JUMP HOST
+
+Checks 3, 4 and 6 talk to the BIG-IPs and to the VIP, which are only reachable from inside the
+VPC. Open a shell on the jump host 🖥️ WORKSTATION:
 
 ```bash
-PW='<admin password>'
-curl -sku admin:"$PW" https://10.0.1.11/mgmt/shared/cloud-failover/inspect | python3 -m json.tool
+aws ssm start-session --region "$REGION" --target "$JUMP"
 ```
 
-`"routes"` must list your three route tables. `"addresses"` being empty is correct — this
-design has no Elastic IPs to move. Note which device reports `"deviceStatus": "active"`.
+> **The jump host cannot look these values up for itself.** Its instance profile carries only
+> `AmazonSSMManagedInstanceCore` — deliberately, so that a shell on the jump host is not a
+> route to your account. That means no `cloudformation:DescribeStacks` and no
+> `secretsmanager:GetSecretValue`: running the section 6.1 block there fails with an access
+> or endpoint error. That is least privilege working, not a broken jump host.
 
-**Check 4 — the next-hop list must contain bare addresses.** On **both** devices:
+So carry the values across. **Back on 🖥️ WORKSTATION**, print a ready-made block — this also
+fetches the admin password, which the checks need:
 
 ```bash
-curl -sku admin:"$PW" https://10.0.1.11/mgmt/shared/cloud-failover/declare \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin)["declaration"]["failoverRoutes"]["routeGroupDefinitions"][0]["defaultNextHopAddresses"]["items"])'
-# → ['10.0.0.11', '10.0.4.11']     ✅ both bare
-# → ['10.0.0.11/24', '10.0.4.11']  ❌ see troubleshooting
+SECRET=$(o bigIpSecretArn)
+PW=$(aws secretsmanager get-secret-value --region "$REGION" \
+  --secret-id "$SECRET" --query SecretString --output text)
+
+# %q shell-quotes each value, so a password containing a space, $, quote or
+# backslash still pastes correctly on the other side
+printf 'MGMT01=%q\nMGMT02=%q\nVIP=%q\nPW=%q\n' "$MGMT01" "$MGMT02" "$VIP" "$PW"
 ```
 
-**Check 5 — the active device and the route target must agree.** This one catches a real
-condition seen in the lab: the template points all three routes at instance A when the stack
-is built, but the initial election can make **instance B** active. CFE only acts on a
-failover *transition*, so coming up active at boot does not move the routes - and the stack
-reaches `CREATE_COMPLETE` with a VIP that has never passed traffic.
+Copy those four lines and paste them into the **jump host** shell. Everything from here to the
+end of section 6 runs there.
 
-Compare the `deviceStatus` from check 3 with the route target from check 2. If they name
-different devices, run **one** failover from the active device to sync them:
+> **Why `%q` and not plain `%s`.** If you supplied your own secret in section 4.2 — which is
+> the recommended path — the password can contain a space, `$`, a quote or a backslash. Pasted
+> unquoted, `PW=two words` sets `PW=two` and then tries to run `words`. `%q` shell-quotes each
+> value so it survives the paste intact.
+
+> **This puts the admin password into that shell's history and process list.** On a
+> single-operator lab jump host that is an acceptable trade for a readable procedure. It is
+> also one more reason the host is thrown away with the stack in section 10. Run
+> `unset PW; history -c` before you leave the session if the account is shared.
+
+### 6.5 Check 3 — CFE has discovered the routes — 🔒 JUMP HOST
+
+```bash
+curl -sku "admin:$PW" "https://${MGMT01}/mgmt/shared/cloud-failover/inspect" \
+  | python3 -m json.tool
+```
+
+What to look for in the JSON:
+
+| Field | Expected |
+|---|---|
+| `"routes"` | Lists **your three route tables**. Empty here means CFE found nothing to manage and failover will do nothing. |
+| `"addresses"` | **Empty is correct.** This design has no Elastic IPs and no secondary private IPs to move — only routes. |
+| `"deviceStatus"` | Either `active` or `standby`. **Write down which device says `active`** — checks 5 and 6 both need it. |
+
+### 6.6 Check 4 — the next-hop list must contain bare addresses — 🔒 JUMP HOST
+
+CFE matches its next-hop list against the Self IPs it discovers. A next hop written with a
+mask never matches, so CFE finds no candidate interface and the route is never moved. Run this
+against **both** devices — the loop does both for you:
+
+```bash
+for IP in "$MGMT01" "$MGMT02"; do
+  echo "--- $IP ---"
+  curl -sku "admin:$PW" "https://${IP}/mgmt/shared/cloud-failover/declare" \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["declaration"]["failoverRoutes"]["routeGroupDefinitions"][0]["defaultNextHopAddresses"]["items"])'
+done
+```
+
+```
+--- 10.0.1.11 ---
+['10.0.0.11', '10.0.4.11']        ✅ both bare — correct
+--- 10.0.5.11 ---
+['10.0.0.11/24', '10.0.4.11']     ❌ a mask on the first entry — see troubleshooting
+```
+
+Both devices must print bare addresses with no `/mask`. If either shows a mask, see
+[troubleshooting](#the-vip-does-not-answer-at-all).
+
+### 6.7 Check 5 — the active device and the route target must agree
+
+This one catches a real condition seen in the lab, and it is the reason a stack can reach
+`CREATE_COMPLETE` with a VIP that has never passed a packet. The template points all three
+routes at **instance A** when the stack is built, but the initial cluster election can make
+**instance B** active. CFE only acts on a failover *transition* — coming up active at boot is
+not a transition, so it never moves the routes.
+
+Compare two things you already have:
+
+- the device reporting `"deviceStatus": "active"` in **check 3**, and
+- the interface ID in the right-hand column of **check 2**.
+
+`$ENI01` is instance A, `$ENI02` is instance B. If they name the **same** device, this check
+passes and you are done — move to 6.8.
+
+If they name **different** devices, run one failover **from the device that is currently
+active** to make them agree. Get a shell on that device (⚙️ BIG-IP — from the jump host,
+`ssh admin@$MGMT01` or `ssh admin@$MGMT02`, same admin password), then:
 
 ```bash
 tmsh run sys failover standby
 ```
 
-Then re-check. This is a normal post-deployment step, not a fault.
+Re-run check 2. The route target should now be the other device's interface, matching whatever
+went active.
 
-**Check 6 — the VIP answers.** From a jump host shell:
+> **This is a normal post-deployment step, not a fault.** It is a one-time reconciliation of
+> the template's initial guess with the cluster's own election. Once they agree, every
+> subsequent failover is a real transition and CFE handles it automatically.
+
+### 6.8 Check 6 — the VIP answers — 🔒 JUMP HOST
 
 ```bash
-curl -sk https://10.99.0.100/ | grep -oE 'failover0[12][.a-z]*'
+curl -sk --max-time 10 "https://${VIP}/" | grep -oE 'failover0[12][.a-z]*'
 ```
 
-With no back-end application deployed, a built-in iRule answers and names the device that
-served the request. Confirm it matches the device reporting `active` in check 3. If the
-route points at the standby, the VIP will hang — see
+Expect a single line naming the device that served the request — `failover01` or
+`failover02`. It must match the device reporting `active` in check 3.
+
+> **With no back-end application deployed** (`provisionExampleApp=false`, the default) a
+> built-in iRule answers directly and names the device. The pool is genuinely empty, so the
+> GUI shows the virtual server as **Available (Offline)** while `curl` returns `200`. Both are
+> correct — see the note at the end of [section 5.1](#51-the-big-ip-web-gui-tmui).
+
+**If this returns nothing**, the `--max-time 10` above means it fails in ten seconds rather
+than hanging. The usual cause is that the route points at the standby device — which is
+check 5, not a fault in the VIP. Work back through checks 1, 2 and 5 in that order, then see
 [troubleshooting](#the-vip-does-not-answer-at-all).
+
+### 6.9 Scoreboard
+
+All six should be true before you move on to failover testing:
+
+| # | Passing result |
+|---|---|
+| 1 | `SourceDestCheck` is `False` on **both** external interfaces |
+| 2 | Every route table row shows the tag **and** the same interface ID |
+| 3 | `"routes"` lists your route tables; `"addresses"` is empty |
+| 4 | `defaultNextHopAddresses` are bare on **both** devices |
+| 5 | The `active` device matches the interface the routes point at |
+| 6 | The VIP returns the name of that same device |
+
+If all six pass, the design is working end to end and [section 8](#8-testing-failover) will
+move the VIP. If any fail, fix it before failing over — a failover test on a broken VIP tells
+you nothing you did not already know.
 
 ---
 
@@ -1473,12 +1757,13 @@ return to `In Sync` without intervention.
 The single most common question once a customer is past the example application: **where do our
 real VIPs go, and do they have to be AS3?**
 
-**The unit of failover is the prefix, not the VIP.** The stack creates one route per route table
-for the whole of `externalVipCidr` — `10.99.0.0/24` by default — pointed at the active device's
-external interface, and CFE's `scopingAddressRanges` is that same prefix. CFE moves the *route*.
-It never looks at your virtual server list and has no per-VIP configuration.
+**The unit of failover is the alien prefix, not the individual VIP.** The stack creates one route
+per route table for the whole of `externalVipCidr` — `10.99.0.0/24` by default — pointed at the
+active device's external interface, and CFE's `scopingAddressRanges` is that same prefix.
+CFE moves the *route*. It never looks at your virtual server list and has no per-VIP
+configuration.
 
-**So every address inside `externalVipCidr` already fails over.** `10.99.0.100` is simply the one
+**So every alien IP inside `externalVipCidr` already fails over.** `10.99.0.100` is simply the one
 the example uses. `10.99.0.101` through `10.99.0.254` are already routed and already in scope.
 Adding a production VIP requires:
 
@@ -1642,68 +1927,249 @@ configuration is already synchronised and this is housekeeping.
 
 ## 10. Tearing the stack down
 
-Cloud Failover Extension creates an S3 bucket for its failover state, and **CloudFormation
-cannot delete a bucket that still has objects in it**. Empty it first or the stack delete
-fails partway and leaves resources behind:
+Deleting this stack is not quite a one-liner, because of one resource CloudFormation cannot
+remove on its own. Work through 10.1 to 10.4 in order.
+
+### 10.1 Set your variables again
+
+🖥️ WORKSTATION. If you opened a new terminal since section 4, the variables you set in
+section 4.1 are gone — shell variables do not survive closing the window. Set them again, and
+**do not skip `REGION`**: almost every command below is Region-scoped, and without it the CLI
+falls back to your default Region, which in a GovCloud account is very often a commercial one.
+A command pointed at the wrong Region does not error helpfully — it reports that nothing
+exists, which reads exactly like a successful cleanup:
 
 ```bash
-STACK=<your-stack-name>
+REGION=us-gov-east-1          # the Region the stack was built in
+STACK=failover-airgap         # the stack name you used in section 4.8
 
-CFEB=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+echo "REGION=$REGION  STACK=$STACK"
+```
+
+Confirm the stack is really there and finished building before you touch anything:
+
+```bash
+aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+  --query 'Stacks[0].[StackName,StackStatus,CreationTime]' --output table
+```
+
+> **Do not run this procedure against a stack that is still building.** Step 10.2 empties a
+> bucket that a running BIG-IP is actively writing to. If you need to abandon a build in
+> progress, skip straight to the plain `delete-stack` in 10.3 and let CloudFormation remove
+> the bucket along with everything else — while the instances are still alive, the bucket
+> normally still has objects in it, so that delete may fail and need 10.2 afterwards. That is
+> fine; it is the emptying-while-live that you want to avoid.
+
+### 10.2 Empty the CFE state bucket first
+
+Cloud Failover Extension creates its own S3 bucket to hold failover state, and
+**CloudFormation cannot delete a bucket that still has objects in it.** If you skip this, the
+stack delete runs for several minutes, fails on that one resource, and leaves a
+half-deleted stack behind — which is more work to clean up than doing this first.
+
+🖥️ WORKSTATION — find the bucket. Do this **before** deleting the stack, because
+`describe-stacks` stops working the moment the stack is gone:
+
+```bash
+CFEB=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
   --query "Stacks[0].Outputs[?OutputKey=='cfeS3Bucket'].OutputValue" --output text)
 echo "CFE state bucket: $CFEB"
+```
 
+You should see a name ending in `-bigip-high-availability-solution` — the stack builds it as
+`<uniqueString>-bigip-high-availability-solution`, so with the default `uniqueString=myuniqstr`
+it is `myuniqstr-bigip-high-availability-solution`.
+
+> **If that comes back empty or as `None`**, the stack is already partly deleted or the name
+> or Region is wrong. Find the bucket by its name instead — it is the only one shaped like
+> this:
+>
+> ```bash
+> aws s3 ls | grep bigip-high-availability-solution
+> ```
+
+**Now check what you are about to delete, before you delete it.** This guard compares the CFE
+bucket against your staging bucket and refuses if they are the same. Paste it as one block:
+
+```bash
+BUCKET=f5-cft-gov     # your STAGING bucket from section 4.4 — the templates and RPMs
+
+if [ -z "$CFEB" ] || [ "$CFEB" = "None" ]; then
+  echo "STOP: CFEB is empty — do not run the delete. Re-check STACK and REGION."
+elif [ "$CFEB" = "$BUCKET" ]; then
+  echo "STOP: that is your STAGING bucket, not CFE's state bucket. Do not delete it."
+else
+  echo "OK to empty: $CFEB"
+  aws s3 ls "s3://$CFEB" --recursive --summarize | tail -5
+fi
+```
+
+Only when that prints `OK to empty:` and a short listing, empty it:
+
+```bash
 aws s3 rm "s3://$CFEB" --recursive
-aws cloudformation delete-stack --stack-name "$STACK"
-aws cloudformation wait stack-delete-complete --stack-name "$STACK" && echo deleted
 ```
 
-> ⚠️ `$CFEB` is CFE's **state** bucket, created by the stack. It is not your staging bucket
-> of templates and artifacts — do not delete that one.
+> ⚠️ **`$CFEB` is CFE's state bucket, created and owned by this stack.** It is *not* the
+> staging bucket of templates and artifacts you built in section 4.4. Deleting that one means
+> re-uploading everything, including the RPMs and installer you had to fetch from the
+> internet. They are easy to confuse because both are S3 buckets that this guide talks about.
 
-**Never run this against a stack that is still building.** Deleting the CFE state bucket of
-a live stack removes the file the extension is actively using. If you need to abandon a
-build in progress, delete the stack and let CloudFormation remove the bucket with it.
+> The CFE bucket is created without versioning, so `rm --recursive` genuinely empties it —
+> there are no hidden object versions left behind to block the delete. (On a versioned bucket
+> it would not be enough, which is a common reason this step appears to have worked and the
+> stack delete fails anyway.)
 
-**Then confirm nothing billable survived.** A delete that fails partway can strand NAT
-gateways and Elastic IPs, both of which bill by the hour:
+### 10.3 Delete the stack
+
+🖥️ WORKSTATION:
 
 ```bash
-aws ec2 describe-nat-gateways --filter "Name=state,Values=available,pending" \
+aws cloudformation delete-stack --region "$REGION" --stack-name "$STACK"
+```
+
+That command returns **immediately and silently** — it only queues the delete. To wait for it:
+
+```bash
+aws cloudformation wait stack-delete-complete --region "$REGION" --stack-name "$STACK" \
+  && echo "deleted"
+```
+
+**Expect several minutes with no output at all.** The waiter prints nothing while it polls.
+Teardown is not instant: the nested stacks come down one at a time in dependency order
+— seven of them with this guide's defaults, which skip the bastion and the example app —
+and network interfaces in particular detach slowly.
+
+> **Two confusing outcomes, both normal:**
+>
+> - **The waiter eventually gives up** with `Waiter StackDeleteComplete failed: Max attempts
+>   exceeded`. That is the *waiter* timing out, not the delete failing. Check the real status
+>   with the command below.
+> - **Checking status on a fully deleted stack is an error.** Once it is genuinely gone,
+>   `describe-stacks` replies `Stack with id failover-airgap does not exist`. That error **is**
+>   the success signal. Nothing is wrong.
+>
+> ```bash
+> aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+>   --query 'Stacks[0].StackStatus' --output text
+> ```
+
+### 10.4 Confirm nothing billable survived
+
+A delete that fails partway can strand resources that bill by the hour. Check for them
+🖥️ WORKSTATION:
+
+```bash
+aws ec2 describe-instances --region "$REGION" \
+  --filters "Name=instance-state-name,Values=running,stopped" \
+  --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name,Tags[?Key==`Name`]|[0].Value]' \
+  --output table
+
+aws ec2 describe-nat-gateways --region "$REGION" \
+  --filter "Name=state,Values=available,pending" \
   --query 'NatGateways[].[NatGatewayId,VpcId,State]' --output table
-aws ec2 describe-addresses --query 'Addresses[].[PublicIp,AllocationId,AssociationId]' --output table
-aws ec2 describe-instances --filters "Name=instance-state-name,Values=running" \
-  --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`]|[0].Value]' --output table
+
+aws ec2 describe-addresses --region "$REGION" \
+  --query 'Addresses[].[PublicIp,AllocationId,AssociationId]' --output table
 ```
 
-All three should be empty for this stack. A current air-gap deployment creates no NAT
-gateways or Elastic IPs at all, so any that appear are either from another stack or from an
-older deployment built before that change.
+**How to read that.** These are account-wide, not stack-scoped, so do not panic at the first
+row you see — it may belong to a colleague or another project. What matters:
 
-**If the delete fails**, find the blocking resource rather than retrying blindly:
+- **A current air-gap deployment creates no NAT gateways and no Elastic IPs at all**
+  (`provisionNatGateways` is hard-set to `false`, and removing EIPs is the entire point of this
+  design). So anything in those two tables is from something else — another stack, or an
+  older deployment built before that change. Confirm before deleting.
+- In the instance table, look for `failover01` / `failover02` and the `*-ssm-jump` host. A
+  stopped BIG-IP still bills for its EBS volume, so a stopped instance is not a free one.
+
+**The one check that is genuinely stack-scoped** is whether any piece of the stack is stuck in
+`DELETE_FAILED`. This covers the nested stacks too, which is what you usually need:
 
 ```bash
-aws cloudformation describe-stack-events --stack-name "$STACK" \
+aws cloudformation list-stacks --region "$REGION" --stack-status-filter DELETE_FAILED \
+  --query "StackSummaries[?contains(StackName, '$STACK')].[StackName,StackStatus]" --output table
+```
+
+Empty output here means the teardown was clean.
+
+### 10.5 If the delete fails
+
+Find the blocking resource rather than retrying blindly:
+
+```bash
+aws cloudformation describe-stack-events --region "$REGION" --stack-name "$STACK" \
   --query 'StackEvents[?ResourceStatus==`DELETE_FAILED`].[LogicalResourceId,ResourceType,ResourceStatusReason]' \
   --output table
 ```
 
-The usual causes are the CFE bucket having been repopulated (empty it again — the instances
-are gone by then, so nothing will rewrite it) or an interface still detaching, which
-generally clears on a retry a few minutes later. As a last resort you can abandon a specific
-resource, but anything retained stays in your account and must be deleted by hand:
+> **If that only tells you a nested stack failed**, you are looking one level too high. The
+> parent reports something like `Embedded stack ... was not successfully deleted`, and the
+> actual reason lives in the **nested** stack's events. Take the failing nested stack's name
+> from the `list-stacks` command in 10.4 — it looks like `failover-airgap-BigIpInstance01-ABC123`
+> — and run the same `describe-stack-events` against **that** name.
+
+The two usual causes:
+
+| Reason | What to do |
+|---|---|
+| The CFE bucket is not empty | Empty it again and re-run the delete. By this point the instances are gone, so nothing will rewrite it. |
+| A network interface is still detaching | Wait a few minutes and re-run `delete-stack`. This one clears on its own far more often than not. |
+
+Re-running `delete-stack` on a `DELETE_FAILED` stack is safe and is the normal fix — it
+retries only what is left.
+
+As a genuine last resort you can abandon a specific resource:
 
 ```bash
-aws cloudformation delete-stack --stack-name "$STACK" --retain-resources <LogicalResourceId>
+aws cloudformation delete-stack --region "$REGION" --stack-name "$STACK" \
+  --retain-resources '<LogicalResourceId>'
 ```
 
-**What survives deliberately.** The admin secret and the SSH key pair are not stack
-resources when you supply them yourself, so they persist for the next deployment. If you
-let the stack generate the secret, it is deleted with the stack but held under Secrets
-Manager's recovery window (30 days by default), so repeated deploy/destroy cycles
-accumulate `*-bigIpSecret-*` entries with identical name prefixes. Creating one secret
-yourself and passing `bigIpSecretArn` avoids both the clutter and a new random password on
-every build.
+> **`--retain-resources` only works on a stack already in `DELETE_FAILED`** — on a healthy
+> stack the command is rejected. And anything you retain stays in your account, still billing,
+> and must then be deleted by hand. Use it to get unstuck, then go delete the retained
+> resource yourself.
+
+### 10.6 What survives on purpose, and what to keep
+
+Some things deliberately outlive the stack:
+
+| Thing | Why it survives | Keep it? |
+|---|---|---|
+| The **staging bucket** (section 4.4) | You created it, not the stack | **Keep it.** It makes the next deploy a single `s3 sync`. |
+| The local **`artifacts/`** folder | Downloaded by hand, never in the repo | **Keep it.** It is the only part of the build that needs internet access. |
+| The **admin secret** (`bigIpSecretArn`) | Not a stack resource when you supply it | Keep it — reusing it keeps the password stable across rebuilds. |
+| The **SSH key pair** | Not a stack resource when you supply it | Keep it. |
+
+**The one that quietly piles up.** If you let the stack *generate* the secret rather than
+passing `bigIpSecretArn`, it is deleted with the stack — but Secrets Manager holds deleted
+secrets for a recovery window (30 days by default) rather than removing them. Repeated
+deploy/destroy cycles therefore accumulate `*-bigIpSecret-*` entries that still occupy their
+names. List them:
+
+```bash
+aws secretsmanager list-secrets --region "$REGION" --include-planned-deletion \
+  --query "SecretList[?contains(Name, 'bigIpSecret')].[Name,DeletedDate]" --output table
+```
+
+To remove one immediately rather than waiting out the window:
+
+```bash
+aws secretsmanager delete-secret --region "$REGION" \
+  --secret-id '<name-or-arn-from-the-list-above>' --force-delete-without-recovery
+```
+
+> ⚠️ `--force-delete-without-recovery` is **irreversible** — there is no undo and no recovery
+> window. Run the `list-secrets` command first and delete by exact name, one at a time. Never
+> point it at a secret you did not create for this lab.
+
+Creating one secret yourself and passing `bigIpSecretArn` avoids this entirely, and is why
+section 4.2 recommends it.
+
+> **Open Session Manager tunnels.** If you still have a port-forward running in another
+> terminal from section 5 or 7, it dies with the jump host. Press `Ctrl-C` in that window to
+> close it cleanly rather than leaving a dead session behind.
 
 ---
 
@@ -1773,15 +2239,15 @@ onboarding never ran.
 
 ```bash
 # what CFE believes it manages
-curl -su admin:<password> http://localhost:8100/mgmt/shared/cloud-failover/inspect \
+curl -su 'admin:<password>' http://localhost:8100/mgmt/shared/cloud-failover/inspect \
   | python3 -m json.tool
 
 # the live declaration, including the next-hop list
-curl -su admin:<password> -X POST http://localhost:8100/mgmt/shared/cloud-failover/declare \
+curl -su 'admin:<password>' -X POST http://localhost:8100/mgmt/shared/cloud-failover/declare \
   -d '{"action":"discover"}' | python3 -m json.tool
 
 # version and status
-curl -su admin:<password> http://localhost:8100/mgmt/shared/cloud-failover/info
+curl -su 'admin:<password>' http://localhost:8100/mgmt/shared/cloud-failover/info
 ```
 
 In the declaration, check `defaultNextHopAddresses.items`:
@@ -1919,13 +2385,13 @@ TLS, and logged in CloudTrail. Clear the stale entry and reconnect:
 
 ```bash
 ssh-keygen -R '[localhost]:2222'
-ssh -i ~/.ssh/<your-key>.pem -p 2222 admin@localhost
+ssh -i "$HOME/.ssh/<your-key>.pem" -p 2222 admin@localhost
 ```
 
 If you rebuild often, keep the tunnel's host keys out of your real `known_hosts` entirely:
 
 ```bash
-ssh -i ~/.ssh/<your-key>.pem -p 2222 \
+ssh -i "$HOME/.ssh/<your-key>.pem" -p 2222 \
   -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no admin@localhost
 ```
 
@@ -1966,7 +2432,7 @@ aws ssm start-session --region "$REGION" --target "$JUMP" \
   --parameters '{"host":["10.0.1.11"],"portNumber":["22"],"localPortNumber":["2222"]}'
 
 # terminal 2
-ssh -i ~/.ssh/<your-key>.pem -p 2222 admin@localhost
+ssh -i "$HOME/.ssh/<your-key>.pem" -p 2222 admin@localhost
 ```
 
 Then use the `hostname` test from the first entry in this section to tell "still working" from
@@ -2271,6 +2737,71 @@ Your bucket has an older copy of a shared module. The air-gap solution needs the
 `modules/network/network.yaml` and `modules/bigip-standalone/bigip-standalone.yaml`, not
 just the `failover-airgap/` directory. Re-run the `s3 sync` from
 [step 4.4](#44-stage-the-s3-bucket).
+
+### The BIG-IPs never fetched their artifacts
+
+**Symptom.** The stack times out or rolls back, and on a BIG-IP that you kept alive with
+`--on-failure DO_NOTHING`, `/var/log/cloud/startup-script.log` shows a `403`, a `404`, or a
+connection that never completed when fetching the runtime-init installer, `gpg.key` or an RPM.
+Nothing after that point ever ran.
+
+**Why the section 4.5 check can pass and this still happen.** That check runs from your
+workstation, over the internet. The BIG-IPs fetch the same objects from **inside the VPC**,
+with no internet, through the S3 **gateway** endpoint. A bucket policy problem breaks both
+paths; a VPC-side problem breaks only the second one, and the workstation check cannot see it.
+
+**Verify the path the BIG-IPs actually use.** Do it from the jump host, which sits in the same
+VPC. This needs one parameter, because the jump host cannot reach S3 by default:
+
+> **Why a security group rule is needed at all.** The stack already creates the S3 gateway
+> endpoint, and the jump host's subnet route table is already associated with it. But a gateway
+> endpoint does not give S3 an address inside your VPC — traffic still leaves for S3's own
+> public address ranges, it simply never traverses the internet. The jump host's security group
+> allows egress only to the VPC CIDR, so it does not cover those ranges. An AWS-managed
+> **prefix list** is the only way to write "S3 in this Region" as a security group destination.
+
+Find the prefix list ID for your Region 🖥️ WORKSTATION:
+
+```bash
+aws ec2 describe-managed-prefix-lists --region "$REGION" \
+  --filters "Name=prefix-list-name,Values=com.amazonaws.${REGION}.s3" \
+  --query 'PrefixLists[0].PrefixListId' --output text
+```
+
+Set that value as `ssmJumpS3PrefixListId` and redeploy, or update the existing stack. Then,
+from a jump host shell 🔒 JUMP HOST, run the same reachability check section 4.5 ran — this
+time over the path that matters:
+
+```bash
+BUCKET=f5-cft-gov                                    # your staging bucket
+PREFIX=f5-aws-cloudformation-v2/v3.6.0.0/examples    # your prefix
+REGION=us-gov-east-1
+
+for KEY in \
+  "${PREFIX}/f5-bigip-runtime-init-2.0.3-1.gz.run" \
+  "${PREFIX}/gpg.key" \
+  "${PREFIX}/bigip-extensions/f5-declarative-onboarding-1.47.0-14.noarch.rpm" \
+  "${PREFIX}/bigip-extensions/f5-appsvcs-3.56.0-10.noarch.rpm" \
+  "${PREFIX}/bigip-extensions/f5-cloud-failover-2.4.0-0.noarch.rpm"; do
+  printf '%s  %s\n' \
+    "$(curl -sk --max-time 15 -o /dev/null -w '%{http_code}' \
+       "https://${BUCKET}.s3.${REGION}.amazonaws.com/${KEY}")" "$KEY"
+done
+```
+
+How to read the result:
+
+| Result from the jump host | Meaning |
+|---|---|
+| `200` on every line | The VPC path is fine. The artifacts are reachable and the failure is elsewhere — read `/var/log/cloud/startup-script.log` on the BIG-IP. |
+| `403` | Bucket policy or Block Public Access. Same cause as a `403` from your workstation — redo [section 4.5](#45-make-the-artifacts-readable-required). |
+| `404` | That object was never uploaded. The `.run`, `gpg.key` and the RPMs are **not** part of `s3 sync` — they need the `s3 cp` commands in [section 4.4](#44-stage-the-s3-bucket). |
+| `000`, or it hangs to the `--max-time` | The request never completed. Either `ssmJumpS3PrefixListId` is not set on the running stack, or the S3 gateway endpoint is missing from this subnet's route table. |
+
+> **This is a diagnostic, not a security hole, but it is also not free.** The rule permits
+> egress to every S3 bucket in the Region, not only yours — that is the granularity a prefix
+> list offers. Traffic stays on the gateway endpoint and never reaches the internet. Leave the
+> parameter blank on a build where you do not need the check.
 
 ### `Failover initialization failed` / `ECONNREFUSED` during onboarding
 
