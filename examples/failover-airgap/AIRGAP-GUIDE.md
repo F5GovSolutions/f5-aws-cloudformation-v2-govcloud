@@ -1039,6 +1039,7 @@ stack would time out even though the cluster formed correctly.
 **Watching it.** From a jump host shell, SSH to a BIG-IP and:
 
 ```bash
+# ⚙️ BIG-IP
 tail -f /config/cluster-heal/log
 ```
 
@@ -1211,6 +1212,7 @@ If those exist, the deployment is fine and you are looking at a navigation probl
 listing is genuinely empty, check whether AS3 deployed at all:
 
 ```bash
+# ⚙️ BIG-IP
 curl -su 'admin:<password>' http://localhost:8100/mgmt/shared/appsvcs/declare | python3 -m json.tool | head -40
 ```
 
@@ -1315,8 +1317,22 @@ OUT=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK
   --query 'Stacks[0].Outputs' --output json)
 
 # helper: pull one output value out of that JSON by its key
-o() { printf '%s' "$OUT" | python3 -c \
-  "import sys,json; print(next((x['OutputValue'] for x in json.load(sys.stdin) if x['OutputKey']=='$1'), ''))"; }
+o() { printf '%s' "$OUT" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)          # no outputs to read - o() returns blank, see the check below
+print(next((x['OutputValue'] for x in d if x['OutputKey'] == '$1'), ''))
+"; }
+
+# Fail here with a useful message rather than once per lookup with a traceback.
+if [ -z "$OUT" ] || [ "$OUT" = "null" ]; then
+  echo "STOP: no outputs for stack '$STACK' in $REGION. Your stack names:"
+  aws cloudformation list-stacks --region "$REGION" \
+    --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
+    --query 'StackSummaries[].StackName' --output text
+fi
 
 ENI01=$(o bigIpExternalInterfaceId01)   # instance A external interface — initial route target
 ENI02=$(o bigIpExternalInterfaceId02)   # instance B external interface
@@ -1326,12 +1342,22 @@ VIP=$(o vipAddress)                     # e.g. 10.99.0.100
 VIPCIDR=$(o vipRouteCidr)               # e.g. 10.99.0.0/24  — the alien prefix
 JUMP=$(o ssmJumpInstanceId)
 
-# vipRouteTableIds is a COMMA-separated list; the CLI wants them space-separated
-RTBS=$(o vipRouteTableIds | tr ',' ' ')
+# vipRouteTableIds is a COMMA-separated list and the CLI wants each ID as its own
+# argument. Use an ARRAY: it expands the same way in bash and zsh. A plain string
+# does not - zsh never word-splits an unquoted variable, so all three IDs would
+# arrive as one argument and the CLI would reject them as a single unknown ID.
+RTBS=( $(o vipRouteTableIds | tr ',' ' ') )
 
 printf 'ENI01=%s\nENI02=%s\nMGMT01=%s\nMGMT02=%s\nVIP=%s\nVIPCIDR=%s\nRTBS=%s\nJUMP=%s\n' \
-  "$ENI01" "$ENI02" "$MGMT01" "$MGMT02" "$VIP" "$VIPCIDR" "$RTBS" "$JUMP"
+  "$ENI01" "$ENI02" "$MGMT01" "$MGMT02" "$VIP" "$VIPCIDR" "${RTBS[*]}" "$JUMP"
 ```
+
+> **A note on shells.** These blocks are written to work in both **bash** and **zsh**, which
+> matters because zsh is the default on macOS. The one place the two genuinely differ is
+> word-splitting: zsh does not split an unquoted variable into separate arguments, so the
+> route table IDs are kept in an array rather than a space-joined string. If you see
+> `InvalidRouteTableID.NotFound` naming all three IDs run together as one, that is this
+> difference, and it means `RTBS` was set as a string somewhere rather than as an array.
 
 Every line of that output must have a value after the `=`. **A blank means the lookup failed**,
 almost always because `REGION` or `STACK` is wrong, or because the stack has not reached
@@ -1366,10 +1392,9 @@ aws ec2 describe-network-interfaces --region "$REGION" \
 ### 6.3 Check 2 — every route table tagged, and carrying the alien prefix — 🖥️ WORKSTATION
 
 ```bash
-# $RTBS is deliberately UNQUOTED: it holds several IDs that must
-# arrive as separate arguments, not as one string
+# "${RTBS[@]}" expands to one argument per route table ID, in both bash and zsh
 aws ec2 describe-route-tables --region "$REGION" \
-  --route-table-ids $RTBS \
+  --route-table-ids "${RTBS[@]}" \
   --query "RouteTables[].[RouteTableId,Tags[?Key=='f5_cloud_failover_label'].Value|[0],Routes[?DestinationCidrBlock=='${VIPCIDR}'].NetworkInterfaceId|[0]]" \
   --output table
 ```
@@ -1388,41 +1413,86 @@ CLI prints `None`, not an empty cell, for a value it did not find. If the tag co
 instead, the table exists but was never tagged. Either way, see
 [troubleshooting](#the-vip-does-not-answer-at-all).
 
-### 6.4 Get onto the jump host — 🔒 JUMP HOST
+### 6.4 Get onto the jump host — 🖥️ WORKSTATION, then 🔒 JUMP HOST
 
 Checks 3, 4 and 6 talk to the BIG-IPs and to the VIP, which are only reachable from inside the
-VPC. Open a shell on the jump host 🖥️ WORKSTATION:
-
-```bash
-aws ssm start-session --region "$REGION" --target "$JUMP"
-```
+VPC. **Collect what you need first, then open the session** — once you are in the jump host
+shell there is no going back for a value without dropping the session.
 
 > **The jump host cannot look these values up for itself.** Its instance profile carries only
 > `AmazonSSMManagedInstanceCore` — deliberately, so that a shell on the jump host is not a
-> route to your account. That means no `cloudformation:DescribeStacks` and no
+> route into your account. That means no `cloudformation:DescribeStacks` and no
 > `secretsmanager:GetSecretValue`: running the section 6.1 block there fails with an access
 > or endpoint error. That is least privilege working, not a broken jump host.
 
-So carry the values across. **Back on 🖥️ WORKSTATION**, print a ready-made block — this also
-fetches the admin password, which the checks need:
+**Step 1 — 🖥️ WORKSTATION.** This block is **self-contained**: paste it into a brand-new
+terminal and it works. It does not depend on anything section 6.1 set, so you never have to
+scroll back. Edit the two values on the first lines if yours differ:
 
 ```bash
-SECRET=$(o bigIpSecretArn)
-PW=$(aws secretsmanager get-secret-value --region "$REGION" \
-  --secret-id "$SECRET" --query SecretString --output text)
+# 🖥️ WORKSTATION - self-contained, safe to paste into a fresh shell
+REGION=us-gov-east-1                 # your Region
+STACK=failover-airgap                # your stack name
 
+OUT=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+  --query 'Stacks[0].Outputs' --output json)
+o() { printf '%s' "$OUT" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)          # no outputs to read - o() returns blank, see the check below
+print(next((x['OutputValue'] for x in d if x['OutputKey'] == '$1'), ''))
+"; }
+
+# Fail here with a useful message rather than once per lookup with a traceback.
+if [ -z "$OUT" ] || [ "$OUT" = "null" ]; then
+  echo "STOP: no outputs for stack '$STACK' in $REGION. Your stack names:"
+  aws cloudformation list-stacks --region "$REGION" \
+    --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
+    --query 'StackSummaries[].StackName' --output text
+fi
+
+JUMP=$(o ssmJumpInstanceId)
+PW=$(aws secretsmanager get-secret-value --region "$REGION" \
+  --secret-id "$(o bigIpSecretArn)" --query SecretString --output text)
+
+echo '----- copy from here -----'
 # %q shell-quotes each value, so a password containing a space, $, quote or
 # backslash still pastes correctly on the other side
-printf 'MGMT01=%q\nMGMT02=%q\nVIP=%q\nPW=%q\n' "$MGMT01" "$MGMT02" "$VIP" "$PW"
+printf 'MGMT01=%q\nMGMT02=%q\nVIP=%q\nPW=%q\n' \
+  "$(o bigIpInstanceMgmtPrivateIp01)" "$(o bigIpInstanceMgmtPrivateIp02)" \
+  "$(o vipAddress)" "$PW"
+echo '----- to here -----'
 ```
 
-Copy those four lines and paste them into the **jump host** shell. Everything from here to the
-end of section 6 runs there.
+**Step 2 — copy the four lines** between the two markers. Do this *before* opening the
+session, while they are still on screen.
+
+**Step 3 — 🖥️ WORKSTATION, open the session.** `JUMP` was set by the block above:
+
+```bash
+# 🖥️ WORKSTATION
+aws ssm start-session --region "$REGION" --target "$JUMP"
+```
+
+**Step 4 — 🔒 JUMP HOST, paste the four lines** at the prompt. Everything from here to the end
+of section 6 runs in this shell.
+
+> **Typing them by hand is perfectly reasonable.** It is only four values — two management
+> IPs, the VIP and the password. If you already have them, or you are demonstrating and do not
+> want a block of shell on screen, just type them. The printed block exists to save you
+> looking them up, not because the values are special.
+
+> **If you have already dropped into the jump host** and find a variable unset, you do not
+> have to tear down the session. Open a **second terminal**, run the Step 1 block there — it
+> is self-contained, so a fresh shell is fine — and paste the result into your existing jump
+> host window.
 
 > **Why `%q` and not plain `%s`.** If you supplied your own secret in section 4.2 — which is
 > the recommended path — the password can contain a space, `$`, a quote or a backslash. Pasted
 > unquoted, `PW=two words` sets `PW=two` and then tries to run `words`. `%q` shell-quotes each
-> value so it survives the paste intact.
+> value so it survives the paste intact, in both bash and zsh.
 
 > **This puts the admin password into that shell's history and process list.** On a
 > single-operator lab jump host that is an acceptable trade for a readable procedure. It is
@@ -1432,8 +1502,10 @@ end of section 6 runs there.
 ### 6.5 Check 3 — CFE has discovered the routes — 🔒 JUMP HOST
 
 ```bash
-curl -sku "admin:$PW" "https://${MGMT01}/mgmt/shared/cloud-failover/inspect" \
-  | python3 -m json.tool
+# 🔒 JUMP HOST
+curl -sku "admin:$PW" --max-time 15 "https://${MGMT01}/mgmt/shared/cloud-failover/inspect" \
+  | python3 -m json.tool \
+  || echo "no JSON came back - see 'when this errors instead of printing' below"
 ```
 
 What to look for in the JSON:
@@ -1451,10 +1523,25 @@ mask never matches, so CFE finds no candidate interface and the route is never m
 against **both** devices — the loop does both for you:
 
 ```bash
+# 🔒 JUMP HOST
 for IP in "$MGMT01" "$MGMT02"; do
   echo "--- $IP ---"
-  curl -sku "admin:$PW" "https://${IP}/mgmt/shared/cloud-failover/declare" \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin)["declaration"]["failoverRoutes"]["routeGroupDefinitions"][0]["defaultNextHopAddresses"]["items"])'
+  BODY=$(curl -sku "admin:$PW" --max-time 15 "https://${IP}/mgmt/shared/cloud-failover/declare")
+  if [ -z "$BODY" ]; then
+    echo "    no response - is $IP really a BIG-IP management address, and reachable?"
+    continue
+  fi
+  printf '%s' "$BODY" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit("    not JSON - usually a 401 (wrong password) or an HTML error page")
+try:
+    print(d["declaration"]["failoverRoutes"]["routeGroupDefinitions"][0]["defaultNextHopAddresses"]["items"])
+except Exception:
+    sys.exit("    no failoverRoutes block - is CFE configured on this device?")
+'
 done
 ```
 
@@ -1467,6 +1554,20 @@ done
 
 Both devices must print bare addresses with no `/mask`. If either shows a mask, see
 [troubleshooting](#the-vip-does-not-answer-at-all).
+
+> ### When this errors instead of printing
+>
+> | What you see | What it means |
+> |---|---|
+> | `no response - is ... really a BIG-IP management address` | Wrong address, or the device is unreachable from the jump host. |
+> | `not JSON - usually a 401` | The password is wrong. Re-read it from Secrets Manager rather than retyping. |
+> | `no failoverRoutes block` | The device answered, but CFE has no route configuration — the deploy did not finish. |
+>
+> **Check the third octet of the two management addresses.** They are in *different subnets*,
+> one per AZ — `10.0.1.11` and `10.0.5.11` with the default addressing. The digit that changes
+> is the **third**, not the fourth. Transposing them into something like `10.0.1.5` is the
+> easiest mistake to make when typing the values by hand, and the request then goes to an
+> address that is not a BIG-IP at all.
 
 ### 6.7 Check 5 — the active device and the route target must agree
 
@@ -1502,7 +1603,16 @@ went active.
 ### 6.8 Check 6 — the VIP answers — 🔒 JUMP HOST
 
 ```bash
-curl -sk --max-time 10 "https://${VIP}/" | grep -oE 'failover0[12][.a-z]*'
+# 🔒 JUMP HOST
+if [ -z "$VIP" ]; then
+  echo "STOP: \$VIP is not set in this shell - that is the problem, not the VIP."
+  echo "      Set it to your externalVipAddress, e.g.  VIP=10.99.0.100"
+else
+  CODE=$(curl -sk --max-time 10 -o /tmp/vip.out -w '%{http_code}' "https://${VIP}/")
+  echo "HTTP $CODE from $VIP"
+  grep -oE 'failover0[12][.a-z]*' /tmp/vip.out \
+    || echo "    (no device name in the response - see the table below)"
+fi
 ```
 
 Expect a single line naming the device that served the request — `failover01` or
@@ -1513,10 +1623,22 @@ Expect a single line naming the device that served the request — `failover01` 
 > GUI shows the virtual server as **Available (Offline)** while `curl` returns `200`. Both are
 > correct — see the note at the end of [section 5.1](#51-the-big-ip-web-gui-tmui).
 
-**If this returns nothing**, the `--max-time 10` above means it fails in ten seconds rather
-than hanging. The usual cause is that the route points at the standby device — which is
-check 5, not a fault in the VIP. Work back through checks 1, 2 and 5 in that order, then see
-[troubleshooting](#the-vip-does-not-answer-at-all).
+**Reading the result.** The status code is printed first precisely so that "nothing came
+back" and "you did not set a variable" cannot look the same:
+
+| What you see | What it means |
+|---|---|
+| `HTTP 200` and a device name | Pass. |
+| `STOP: $VIP is not set` | Nothing is wrong with the deployment. You are on the jump host and `VIP` was never carried across — see section 6.4. This is easy to hit when you type the values by hand. |
+| `HTTP 000` | Nothing answered within ten seconds. The usual cause is that the route points at the **standby** device — that is check 5, not a fault in the VIP. Work back through checks 1, 2 and 5 in that order. |
+| `HTTP 200` but no device name | Something answered, but not the demo iRule. You may have a real pool behind the VIP, or `provisionExampleApp=true`. |
+| Any other code | The BIG-IP is answering, so the network path is fine — the problem is the virtual server or its pool. |
+
+> **`HTTP 000` is curl's way of saying "no response at all"** — not a status the server sent.
+> It means the request timed out or the connection never completed, which is exactly what a
+> route pointed at the wrong device looks like from here.
+
+Then see [troubleshooting](#the-vip-does-not-answer-at-all).
 
 ### 6.9 Scoreboard
 
@@ -1620,25 +1742,51 @@ self-signed cert, not a proxy problem.
 **Test both directions.** They exercise different devices, and a fault can exist in only
 one — which is exactly what happened during validation of this design.
 
-**Window 1** — a shell on the jump host, running the measurement loop. Start it *before*
-you trigger anything:
+**Both windows are jump host shells**, and the route check at the end is on your
+workstation. The variables below are the ones section 6 set — `VIP`, `MGMT01`, `MGMT02` and
+`PW` in the jump host shells, `RTBS`, `VIPCIDR` and `REGION` on the workstation. Nothing here
+needs an address typed by hand.
+
+**Window 1 — the measurement loop.** Start it *before* you trigger anything. 🖥️ WORKSTATION
+to open the session, then the loop runs 🔒 JUMP HOST:
 
 ```bash
+# 🖥️ WORKSTATION
 aws ssm start-session --region "$REGION" --target "$JUMP"
 ```
+
 ```bash
-while true; do
-  T=$(date +%H:%M:%S.%2N)
-  R=$(curl -sk --max-time 1 https://10.99.0.100/ | grep -oE 'failover0[12][.a-z]*' | head -1)
-  echo "$T ${R:-DOWN}"
-  sleep 0.5
+# 🔒 JUMP HOST - VIP must be set in THIS shell; section 6.4 carries it across
+if [ -z "$VIP" ]; then
+  echo "STOP: \$VIP is not set in this shell - set it first, e.g.  VIP=10.99.0.100"
+else
+  while true; do
+    T=$(date +%H:%M:%S.%2N)
+    R=$(curl -sk --max-time 1 "https://${VIP}/" | grep -oE 'failover0[12][.a-z]*' | head -1)
+    echo "$T ${R:-DOWN}"
+    sleep 0.5
+  done
+fi
+```
+
+**Window 2 — trigger the failover.** A second jump host shell. First confirm **which device is
+active**, because you must trigger on that one:
+
+```bash
+# 🔒 JUMP HOST - which device is active right now?
+for IP in "$MGMT01" "$MGMT02"; do
+  printf '%-12s ' "$IP"
+  curl -sku "admin:$PW" --max-time 15 "https://${IP}/mgmt/shared/cloud-failover/inspect" \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["hostName"], d["deviceStatus"])' \
+    || echo "(no answer)"
 done
 ```
 
-**Window 2** — a second jump host shell; SSH to whichever device is **active** and trigger:
+Then SSH to whichever reported `active` and trigger:
 
 ```bash
-ssh admin@10.0.1.11
+# 🔒 JUMP HOST → ⚙️ BIG-IP (the tmsh lines run on the device once ssh connects)
+ssh admin@"$MGMT01"               # or "$MGMT02" - whichever reported active above
 tmsh show cm failover-status      # confirm this device is ACTIVE first
 tmsh run sys failover standby
 ```
@@ -1660,12 +1808,14 @@ apart. Counting `DOWN` lines badly understates the outage. Measure last-good to 
 17:52:00.88  failover02.local   ← first good response from B
 ```
 
-**Confirm the routes actually moved:**
+**Confirm the routes actually moved** — 🖥️ WORKSTATION, where section 6.1 set `RTBS` and
+`VIPCIDR`:
 
 ```bash
+# 🖥️ WORKSTATION
 aws ec2 describe-route-tables --region "$REGION" \
-  --route-table-ids rtb-AAAA rtb-BBBB rtb-CCCC \
-  --query "RouteTables[].[RouteTableId,Routes[?DestinationCidrBlock=='10.99.0.0/24'].NetworkInterfaceId|[0]]" \
+  --route-table-ids "${RTBS[@]}" \
+  --query "RouteTables[].[RouteTableId,Routes[?DestinationCidrBlock=='${VIPCIDR}'].NetworkInterfaceId|[0]]" \
   --output table
 ```
 
@@ -1673,11 +1823,16 @@ All three should now show the *other* device's interface. And on the newly activ
 the log should show the work being done:
 
 ```bash
+# ⚙️ BIG-IP - the newly ACTIVE device
 grep -E 'Next hop address|Update required|Route\(s\) updated|No route operations' \
   /var/log/restnoded/restnoded.log | tail -12
 # want: "Next hop address: 10.0.x.11" and "Route(s) updated successfully"
 # not:  "Next hop address: undefined" or "No route operations to run"
 ```
+
+A healthy run shows, per failover: one `Next hop address` line carrying a **bare** address
+with no `/mask`, one `Update required (true)` per route table — three of them in the default
+build — and a single `Route(s) updated successfully`.
 
 Then fail back and repeat.
 
@@ -1738,7 +1893,7 @@ and not a fault — the extra time is detection, which a commanded failover skip
 > prev=""
 > while true; do
 >   t=$(date +%H:%M:%S.%3N)
->   c=$(curl -s -m 2 -o /dev/null -w '%{http_code}' http://10.99.0.100/ 2>/dev/null || echo 000)
+>   c=$(curl -s -m 2 -o /dev/null -w '%{http_code}' "http://${VIP}/" 2>/dev/null || echo 000)
 >   [ "$c" != "$prev" ] && { echo "$t  $c"; prev=$c; }
 >   sleep 0.5
 > done
@@ -2314,6 +2469,7 @@ end — the box never got as far as reading the secret.
 **Confirm it, then read the real error:**
 
 ```bash
+# ⚙️ BIG-IP
 # Did the installer ever land?
 which f5-bigip-runtime-init          # "no f5-bigip-runtime-init in ..." = never installed
 ls -l /var/log/f5-bigip-runtime-init.log   # missing = it never ran
@@ -2738,6 +2894,88 @@ Your bucket has an older copy of a shared module. The air-gap solution needs the
 just the `failover-airgap/` directory. Re-run the `s3 sync` from
 [step 4.4](#44-stage-the-s3-bucket).
 
+### `The specified address is already in use` on `BigipStaticExternalInterface`
+
+**Relaunch the stack. Do not change any IP address.** That is the whole fix, and the
+instinct to start re-addressing subnets is the wrong one — it costs an afternoon and does not
+help. The rest of this entry is why.
+
+**Symptom.** The build fails within the first few minutes. The parent stack reports only:
+
+```
+Embedded stack ...-BigIpInstance02-... was not successfully created:
+The following resource(s) failed to create: [BigipStaticExternalInterface]
+```
+
+and the nested stack's own events give the real reason:
+
+```
+Resource handler returned message: "The specified address is already in use.
+(Service: Ec2, Status Code: 400 ...)" (HandlerErrorCode: GeneralServiceException)
+```
+
+It can hit either BIG-IP — `BigIpInstance01` or `BigIpInstance02`.
+
+**Cause: your VPC endpoints and your BIG-IP share a subnet.** `modules/network` places all
+six **interface** VPC endpoints — EC2, Secrets Manager, CloudFormation, SSM, ssmmessages,
+ec2messages — in subnet index 0 of each AZ. That is the **BIG-IP external subnet**
+(`10.0.0.0/24` in AZ A, `10.0.4.0/24` in AZ B with the default addressing). The S3 endpoint is
+a *gateway* endpoint, has no interface, and takes no address — it is not involved.
+
+Each interface endpoint gets one ENI per subnet, and **AWS chooses its address**. There is no
+property on `AWS::EC2::VPCEndpoint` to pin it. Meanwhile `bigIpExternalSelfIp01` / `02` are
+pinned by parameter at `.11`. And because the BIG-IP stacks consume `Network` outputs, the
+Network stack always finishes first — **the endpoints always draw before the BIG-IP does.**
+
+If one of those six draws `.11`, the BIG-IP's external interface has nowhere to go and the
+stack fails.
+
+**How likely.** Six draws from the 251 usable addresses in a `/24`:
+
+| | |
+|---|---|
+| One external subnet | ~2.4% (6 / 251) |
+| Per deploy, across both AZs | ~4.7% — roughly **1 deploy in 21** |
+
+So most builds are fine and an occasional one is not. Nothing about your parameters or your
+bucket is wrong when this happens.
+
+> **Why moving the address does not help.** The tempting fix is to change `.11` to something
+> "out of the way" like `.100`. It does not work: AWS scatters endpoint addresses across the
+> whole subnet rather than filling from the bottom. A real deployment produced these six, in
+> the same `/24` that wanted `.11`:
+>
+> ```
+> .11   .92   .122   .130   .142   .202
+> ```
+>
+> Every address in that subnet carries the same ~2.4% risk. Re-addressing swaps one lottery
+> ticket for another while invalidating the addressing in this guide.
+
+**Confirm it if you want to see it.** With the failed VPC still up (launch with
+`--on-failure DO_NOTHING`), list what is in the external subnet — the culprits are described
+as `VPC Endpoint Interface`:
+
+```bash
+aws ec2 describe-network-interfaces --region "$REGION" \
+  --filters "Name=private-ip-address,Values=10.0.4.11" \
+  --query 'NetworkInterfaces[].[NetworkInterfaceId,Status,VpcId,SubnetId,Description]' --output table
+```
+
+**Only the external subnet is exposed.** The management subnet (index 1) and internal subnet
+(index 2) carry no endpoints, so `bigIpMgmtAddress01` / `02` and `bigIpInternalSelfIp01` / `02`
+are never at risk. Only the two external self IPs are.
+
+**If it fails twice in a row at the same resource**, that is a 1-in-400 coincidence and
+something else is going on — stop relaunching and investigate. Account-level ENI throttling in
+the Region is the first thing to check.
+
+> **The real fix, for anyone maintaining this.** Move the six interface endpoints out of the
+> BIG-IP external subnet, into a subnet where nothing is pinned. That eliminates the collision
+> rather than improving the odds. It is a change to `modules/network`, which
+> `examples/failover` and `quickstart` also use, so it is an upstream decision rather than a
+> local edit — see MAINTAINING.md.
+
 ### The BIG-IPs never fetched their artifacts
 
 **Symptom.** The stack times out or rolls back, and on a BIG-IP that you kept alive with
@@ -2825,6 +3063,7 @@ sync device group, it syncs anyway and the peer rejects it.
 Check the folder, not the route:
 
 ```bash
+# ⚙️ BIG-IP
 tmsh list sys folder /LOCAL_ONLY
 ```
 
@@ -2843,6 +3082,7 @@ normal:
 Fix it on the affected device:
 
 ```bash
+# ⚙️ BIG-IP
 tmsh modify sys folder /LOCAL_ONLY device-group none traffic-group traffic-group-local-only
 tmsh save sys config
 tmsh run cm config-sync to-group failoverGroup
@@ -2863,6 +3103,7 @@ self-heal now detects and corrects this on both devices.
 > of the failed sync** — pushing from the peer does not clear it:
 >
 > ```bash
+> # ⚙️ BIG-IP - the device that was the SOURCE of the failed sync
 > tmsh run cm config-sync force-full-load-push to-group failoverGroup
 > sleep 30
 > tmsh show cm sync-status
@@ -2876,6 +3117,7 @@ self-heal now detects and corrects this on both devices.
 an ongoing failure or a cached one, two checks settle it:
 
 ```bash
+# ⚙️ BIG-IP
 grep -rnE '10\.0\.0\.1([^0-9]|$)' /config/bigip.conf /config/bigip_base.conf /config/partitions/*/bigip.conf
 grep -i '01070330' /var/log/ltm
 ```
@@ -2925,6 +3167,7 @@ names the phase it is in. Common outcomes:
 **Re-arm the self-heal** after manual changes:
 
 ```bash
+# ⚙️ BIG-IP
 rm -f /config/cluster-heal/done /config/cluster-heal/signalled
 echo '*/3 * * * * root /config/cluster-heal.sh >/dev/null 2>&1' > /etc/cron.d/cluster-heal
 ```
@@ -2944,18 +3187,21 @@ interface is not used for clustering. Substitute your own admin password and Sel
 Runtime-init is one-shot and will not re-run its failed clustering:
 
 ```bash
+# ⚙️ BIG-IP
 tmsh reboot
 ```
 
 **2. Once both are back, confirm `Root` exists on each:**
 
 ```bash
+# ⚙️ BIG-IP - both devices
 tmsh list cm trust-domain one-line
 ```
 
 **3. On failover02**, add failover01 over its **external** Self IP (not management):
 
 ```bash
+# ⚙️ BIG-IP - failover02
 tmsh modify cm trust-domain Root ca-devices add { 10.0.0.11 } \
   name failover01.local username admin password '<admin-password>'
 ```
@@ -2965,6 +3211,7 @@ tmsh modify cm trust-domain Root ca-devices add { 10.0.0.11 } \
 **4. On failover01**, create the device group and sync:
 
 ```bash
+# ⚙️ BIG-IP - failover01 ONLY
 tmsh create cm device-group failoverGroup type sync-failover
 tmsh modify cm device-group failoverGroup devices add { failover01.local failover02.local }
 tmsh modify cm device-group failoverGroup auto-sync enabled network-failover enabled
@@ -2981,12 +3228,14 @@ If it stays `Changes Pending` or `Awaiting Initial Sync`, force the initial push
 device holding the authoritative config:
 
 ```bash
+# ⚙️ BIG-IP
 tmsh run cm config-sync force-full-load-push to-group failoverGroup
 ```
 
 **5. Verify on both devices** — expect `Status: In Sync` (green), `Mode: high-availability`:
 
 ```bash
+# ⚙️ BIG-IP - both devices
 tmsh show cm sync-status
 ```
 
